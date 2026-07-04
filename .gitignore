@@ -1,0 +1,10 @@
+# Ignore everything
+*
+
+# Allow these specific files
+!.gitignore
+!README.md
+!YSA.py
+!.github/
+!.github/workflows/
+!.github/workflows/build.yml

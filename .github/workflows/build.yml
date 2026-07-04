@@ -1,0 +1,95 @@
+name: Build YSA EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python packages
+        run: |
+          pip install pyinstaller requests windnd
+
+      - name: Download yt-dlp
+        run: |
+          echo "Downloading yt-dlp from github.com/yt-dlp/yt-dlp..."
+          curl -L -o yt-dlp.exe https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe
+          .\yt-dlp.exe --version
+
+      - name: Download FFmpeg
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          Write-Host "Fetching latest FFmpeg release from github.com/GyanD/codexffmpeg..."
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest" -Headers @{ "User-Agent" = "YSA-Build"; "Authorization" = "token $env:GH_TOKEN" }
+          $version = $release.tag_name
+          Write-Host "Latest version: $version"
+
+          $asset = $release.assets | Where-Object { $_.name -like "*essentials_build.zip" } | Select-Object -First 1
+          if (-not $asset) { Write-Error "essentials_build.zip not found in release assets"; exit 1 }
+
+          Write-Host "Downloading $($asset.name)..."
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile ffmpeg.zip
+
+          Write-Host "Extracting ffmpeg.exe..."
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $ffmpegExe = Get-ChildItem -Path ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Where-Object { $_.DirectoryName -like "*\bin" } | Select-Object -First 1
+          if (-not $ffmpegExe) { Write-Error "ffmpeg.exe not found in archive"; exit 1 }
+          Copy-Item $ffmpegExe.FullName -Destination ffmpeg.exe
+          Remove-Item ffmpeg.zip, ffmpeg_tmp -Recurse -Force
+
+          .\ffmpeg.exe -version | Select-Object -First 1
+
+      - name: Build bgutil server bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "Cloning bgutil-ytdlp-pot-provider v1.3.1..."
+          git clone --single-branch --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git bgutil_src
+
+          Push-Location bgutil_src\server
+
+          Write-Host "Installing npm dependencies..."
+          npm ci
+
+          Write-Host "Compiling TypeScript..."
+          npx tsc
+
+          Write-Host "Removing dev-only packages..."
+          npm prune --production
+
+          Pop-Location
+
+          Write-Host "Copying compiled server to bgutil_bundle..."
+          New-Item -ItemType Directory -Force -Path bgutil_bundle | Out-Null
+          Copy-Item -Path bgutil_src\server\build        -Destination bgutil_bundle\build        -Recurse
+          Copy-Item -Path bgutil_src\server\node_modules -Destination bgutil_bundle\node_modules -Recurse
+          Copy-Item -Path bgutil_src\server\package.json -Destination bgutil_bundle\package.json
+
+          $sizeMB = [math]::Round((Get-ChildItem -Path bgutil_bundle -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+          Write-Host "Bundle ready - $sizeMB MB"
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onedir --noconsole `
+            --add-binary "yt-dlp.exe;." `
+            --add-binary "ffmpeg.exe;." `
+            --add-data "bgutil_bundle;bgutil_bundle" `
+            --hidden-import windnd `
+            --name "YSA" YSA.py
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: YSA-build
+          path: dist/YSA
