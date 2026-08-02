@@ -339,19 +339,46 @@ def _stop_proxy():
         _proxy_server = None
         _proxy_port = None
 
-def enable_custom_dns():
+def _dns_probe_and_warm():
+    """Reachability test + parallel pre-resolve of the YouTube domains.
+
+    This is the slow half of enabling custom DNS: a UDP round trip that can
+    wait out its full timeout, followed by a resolve of every YouTube domain
+    (each with a secondary-DNS fallback). Safe to run off the main thread -
+    _custom_getaddrinfo falls through to normal resolution on a cache miss,
+    so nothing breaks while the warm-up is still in flight.
+
+    Returns True if Google DNS answered.
+    """
+    try:
+        _test_ip, _ = _dns_query('www.youtube.com', _primary_dns, timeout=1)
+    except Exception:
+        _test_ip = None
+    try:
+        _pre_resolve_all()
+    except Exception:
+        pass
+    return bool(_test_ip)
+
+
+def enable_custom_dns(probe=True):
+    """Turn on custom DNS.
+
+    The hook + proxy are installed immediately (a socket bind and a thread
+    start - microseconds). With probe=False the network warm-up is skipped
+    so the caller can run _dns_probe_and_warm() in the background; this is
+    what startup does, because the old version blocked the main thread for
+    up to several seconds BEFORE the window was even built.
+    """
     global _custom_dns_active
-    # Quick test: can we reach Google DNS at all?
-    # If UDP 53 is blocked, the proxy will stall on every hostname.
-    _test_ip, _ = _dns_query('www.youtube.com', _primary_dns, timeout=1)
-    _dns_ok = bool(_test_ip)
     _custom_dns_active = True
-    _pre_resolve_all()
     socket.getaddrinfo = _custom_getaddrinfo
     with _proxy_lock:
         if _proxy_server is None:
             _start_proxy()
-    return _dns_ok  # caller can warn user if DNS is unreachable
+    if not probe:
+        return True
+    return _dns_probe_and_warm()  # caller can warn user if DNS is unreachable
 
 def disable_custom_dns():
     global _custom_dns_active
@@ -395,12 +422,50 @@ def fix_paths():
 # Call fix_paths immediately
 SCRIPT_DIR = fix_paths()
 
+# ═══════════════════════════════════════════════════════════════════════════
+# === BEGIN DEV TOOLS ===  (delete this block + ysa_devtest.py for a
+# non-developer build; nothing outside these markers depends on it)
+#
+# Set to True to expose Settings > Diagnostics, which runs scripted
+# end-to-end scenarios from a JSON file. Also switches on automatically
+# when a file named 'ysa_dev.flag' sits next to the script/exe, so one
+# build can serve both purposes.
+DEV_MODE = False
+try:
+    if os.path.exists(os.path.join(SCRIPT_DIR, 'ysa_dev.flag')):
+        DEV_MODE = True
+except Exception:
+    pass
+# === END DEV TOOLS ===
+# ═══════════════════════════════════════════════════════════════════════════
+
 # YouTube audio format ID → codec lookup.
 # Used to determine AAC vs Opus without spawning an FFmpeg probe process.
 # AAC formats: 139 (48kbps), 140 (128kbps), 141 (256kbps), 256/258 (AAC-LC HE)
 # Opus formats: 249 (50kbps), 250 (70kbps), 251 (160kbps)
 # WebM Vorbis: 171 (128kbps)
 # Any unlisted format_id is treated as unknown (probe fallback used).
+# Errors that no amount of client-switching will fix. A terminated channel,
+# a deleted video or a private one returns the same answer from every player
+# client, so grinding through the full cascade wastes ~7 requests per entry
+# and looks exactly like the automated hammering YouTube's bot checks target.
+_YT_TERMINAL_ERRORS = (
+    'account associated with this video has been terminated',
+    'this video has been removed',
+    'removed by the uploader',
+    'video unavailable',
+    'this video is private',
+    'private video',
+    'this video is no longer available',
+    'video has been removed for violating',
+    'does not exist',
+    'available in your country',      # 'The uploader has not made this
+                                      #  video available in your country'
+    'blocked it in your country',
+    'video is unavailable in your country',
+    'this video is unavailable',
+)
+
 _YT_AUDIO_AAC_IDS  = {'139', '140', '141', '256', '258', '327'}
 _YT_AUDIO_OPUS_IDS = {'249', '250', '251', '338'}
 _YT_AUDIO_VORBIS_IDS = {'171', '172'}
@@ -1106,7 +1171,7 @@ class YouTubeStreamAnalyzerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("YouTube Stream Analyzer")
-        self.root.geometry("1000x1100")
+        self.root.geometry("1000x1100")   # provisional; saved box applied after _load_config
         self.root.minsize(800, 600)
         
         # Configure style
@@ -1209,9 +1274,34 @@ class YouTubeStreamAnalyzerGUI:
         self.preferred_video_bitrate = 0     # 0 = highest available per resolution
         self.audio_only_mode_default = False  # Persisted across sessions via config
         self.audio_only_format = 'm4a_native'         # 'm4a_native', 'm4a_aac', or 'mp3'
+        # ── Audio behaviour settings (Settings > Audio) ──────────────────
+        self.audio_opus_naming     = 'codec'         # codec|m4a|remux|prefer_aac
+        self.audio_bitrate_policy  = 'match_source'  # match_source|match_pref|fixed|max
+        self.audio_fixed_bitrate   = 128             # used when policy == 'fixed'
+        self.audio_drc_pref        = 'avoid'         # avoid|allow|prefer
+        self.audio_quality_tag     = 'audio'         # audio|video|none
+        self.audio_no_aac_action   = 'transcode'     # transcode|keep_opus|skip
+        self.audio_cache_streams   = True            # cache raw audio-only streams
+        self.audio_output_folder   = ''              # '' = same as download_path
+        self.audio_duplicate_action = 'number'       # number|overwrite|skip
+        # Indirection so the dev test runner can sandbox itself onto a
+        # separate config and cache without touching the real ones.
+        self.config_filename = 'ysa_config.json'
+        self.cache_dirname   = 'ysa_cache' 
+        # ── Interface ────────────────────────────────────────────────────
+        self.history_enabled  = True    # record finished downloads in History
+        self.remember_window  = True    # restore window size/position
+        self.window_geometry  = ''      # 'WxH+X+Y' from the last clean exit
+        self.window_maximized = False
+        self.devtest_scenario_file = ''  # dev tools: last scenario file used
+        self.devtest_selected = []       # dev tools: scenario names to run ([] = all)
 
         # Load persistent configuration (overrides defaults above)
         self._load_config()
+        # Saved window box can only be applied AFTER the config is read -
+        # the earlier geometry() call above runs before window_geometry
+        # exists, so restoring there silently did nothing.
+        self._apply_saved_geometry("1000x1100")
         # Auto-detect cookies.txt in the same directory as the exe/script.
         # Only sets the path if the user has not already configured one.
         if not self.cookies_file:
@@ -1277,6 +1367,10 @@ class YouTubeStreamAnalyzerGUI:
         self._prefetch_in_progress = set()  # URLs currently being prefetched
         
         # Initialize cache tracking BEFORE setting up cache directories
+        self._output_listeners = []                # dev test runner taps terminal output
+        self._cache_inuse = set()                  # cached paths a live download is reading
+        self._ck_reap_lock = threading.Lock()       # only one cookie reaper at a time
+        self._precache_lock = threading.Lock()     # created here, not lazily (first-use race)
         self._cache_lock = threading.RLock()       # C1: protects cached_videos and thumbnail set
         self._thumbnail_cached_ids = set()         # C2: avoids os.path.exists per precache item
         self.cached_videos = {}  # {video_id: {format_id: file_path}}  -- video AND audio streams
@@ -1297,13 +1391,20 @@ class YouTubeStreamAnalyzerGUI:
 
         # Enable/disable custom DNS based on loaded config
         if self.custom_dns:
-            _dns_reachable = enable_custom_dns()
-            if not _dns_reachable:
-                # Schedule warning after terminal is ready
-                self.root.after(1500, lambda: self.append_terminal_output(
-                    "WARNING: Custom DNS is ON but Google DNS (8.8.8.8) is unreachable\n"
-                    "on this network. Downloads will stall. Go to Settings and\n"
-                    "turn OFF Custom DNS to fix this.\n", "warning"))
+            # Install the hook + proxy now (microseconds), then warm up the
+            # DNS cache off-thread. Previously the probe and the pre-resolve
+            # of every YouTube domain ran here on the main thread, before
+            # setup_ui(), so the window could not appear until they finished.
+            enable_custom_dns(probe=False)
+
+            def _dns_warmup():
+                _ok = _dns_probe_and_warm()
+                if not _ok:
+                    self.root.after(0, lambda: self.append_terminal_output(
+                        "WARNING: Custom DNS is ON but Google DNS (8.8.8.8) is unreachable\n"
+                        "on this network. Downloads will stall. Go to Settings and\n"
+                        "turn OFF Custom DNS to fix this.\n", "warning"))
+            threading.Thread(target=_dns_warmup, daemon=True).start()
         else:
             disable_custom_dns()
         
@@ -1597,6 +1698,35 @@ class YouTubeStreamAnalyzerGUI:
         self.terminal_text.delete('1.0', tk.END)
         self.append_terminal_output("Terminal cleared.\n", 'info')
 
+    def _emit_dev_event(self, kind, **fields):
+        """Emit a machine-readable event to output listeners only (DEV_MODE).
+
+        yt-dlp's own guidance is that wrappers should never parse its
+        human-readable stdout, and the same argument applies one level up:
+        the dev test runner was detecting completion by string-matching
+        terminal text, which is brittle and - because a concurrent queued or
+        pre-cache download emits the identical strings - could mark the
+        wrong scenario complete.
+
+        This app is not observing yt-dlp from outside; it KNOWS when a
+        download finished and exactly which file it produced. Emitting that
+        ground truth as a JSON line, keyed by video id, removes the guessing
+        entirely. Goes to listeners only, never to the visible terminal.
+        """
+        if not DEV_MODE:
+            return
+        try:
+            payload = {'ev': kind}
+            payload.update(fields)
+            line = '@@YSAEV@@' + json.dumps(payload, default=str) + '\n'
+        except Exception:
+            return
+        for _cb in list(getattr(self, '_output_listeners', ())):
+            try:
+                _cb(line, 'devevent')
+            except Exception:
+                pass
+
     def _mk_var_mirror(self, var, attr, cast=bool):
         """Mirror a Tk variable into a plain attribute via a write-trace (M3).
 
@@ -1698,6 +1828,15 @@ class YouTubeStreamAnalyzerGUI:
             # issue reports = attach the newest file in ysa_cache/logs).
             self._write_session_log(text)
 
+            # Fan out to any registered listeners (the dev test runner taps
+            # this to follow progress and detect completion). Never let a
+            # listener break the UI.
+            for _cb in list(getattr(self, '_output_listeners', ())):
+                try:
+                    _cb(text, tag)
+                except Exception:
+                    pass
+
             # Count newlines added and maintain a running total
             added = text.count('\n')
             self._terminal_line_count += added
@@ -1732,6 +1871,9 @@ class YouTubeStreamAnalyzerGUI:
                 return result
             else:
                 self.append_terminal_output("Running: " + " ".join(cmd[:3]) + "...\n", 'info')
+                # The visible line is truncated to three tokens; the dev
+                # runner needs the whole vector to reproduce a failure.
+                self._emit_dev_event('spawn', argv=list(cmd))
 
                 process = subprocess.Popen(
                     cmd,
@@ -1798,6 +1940,8 @@ class YouTubeStreamAnalyzerGUI:
         except Exception as e:
             raise Exception("Failed to run yt-dlp: " + str(e))
         finally:
+            # cookie copies are reclaimed only by the process-guarded reap
+            pass
             self._download_process = None
             self.root.after(0, self._reset_download_buttons)
 
@@ -1846,6 +1990,323 @@ class YouTubeStreamAnalyzerGUI:
         self._update_subtitle_combo_states()
         self._save_config()
 
+    # === BEGIN DEV TOOLS ===
+    def _setup_diagnostics_panel(self, outer):
+        """Scenario runner UI. Lives on the main window so a run survives
+        tab switching and does not depend on a dialog staying open.
+
+        The content sits in a scrollable canvas: shrinking the window
+        vertically used to clip the panel with no way to reach the rest."""
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        _canvas = tk.Canvas(outer, highlightthickness=0, height=170)
+        _canvas.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.W, tk.E))
+        _vsb = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=_canvas.yview)
+        _vsb.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        _canvas.configure(yscrollcommand=_vsb.set)
+        parent = ttk.Frame(_canvas)
+        _win = _canvas.create_window((0, 0), window=parent, anchor='nw')
+
+        def _on_frame(_e=None):
+            _canvas.configure(scrollregion=_canvas.bbox('all'))
+
+        def _on_canvas(e):
+            _canvas.itemconfigure(_win, width=e.width)
+        parent.bind('<Configure>', _on_frame)
+        _canvas.bind('<Configure>', _on_canvas)
+
+        def _wheel(e):
+            try:
+                _canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+            except Exception:
+                pass
+        _canvas.bind('<Enter>', lambda _e: _canvas.bind_all('<MouseWheel>', _wheel))
+        _canvas.bind('<Leave>', lambda _e: _canvas.unbind_all('<MouseWheel>'))
+
+        parent.columnconfigure(1, weight=1)
+
+        ttk.Label(parent, text="Scenario file:").grid(
+            row=0, column=0, sticky=tk.W, padx=10, pady=(12, 2))
+        self._diag_file_lbl = ttk.Label(
+            parent,
+            text=(getattr(self, 'devtest_scenario_file', '') or "(none selected)"),
+            foreground='gray')
+        self._diag_file_lbl.grid(row=0, column=1, sticky=tk.W, padx=10, pady=(12, 2))
+
+        def _pick():
+            _f = filedialog.askopenfilename(
+                title="Choose scenario file",
+                filetypes=[("Scenario JSON", "*.json"), ("All files", "*.*")])
+            if _f:
+                self.devtest_scenario_file = _f
+                self._diag_file_lbl.config(text=_f)
+                self.devtest_selected = []          # new file - select all
+                self._diag_rebuild_list()
+                self._save_devtest_state()
+
+        _btns = ttk.Frame(parent)
+        _btns.grid(row=1, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(2, 0))
+        ttk.Button(_btns, text="Browse...", command=_pick).pack(side=tk.LEFT)
+        self._diag_run_btn = ttk.Button(_btns, text="Run scenarios",
+                                        command=self._diag_run)
+        self._diag_run_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._diag_stop_btn = ttk.Button(_btns, text="Stop",
+                                         command=self._diag_stop, state='disabled')
+        self._diag_stop_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        # ── scenario picker ──────────────────────────────────────────────
+        # Running all 19 to check one thing wastes time and requests, so the
+        # set is selectable and remembered between sessions.
+        _pick = ttk.LabelFrame(parent, text="Scenarios to run")
+        _pick.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E),
+                   padx=10, pady=(10, 2))
+        _pick.columnconfigure(0, weight=1)
+        self._diag_list = ttk.Frame(_pick)
+        self._diag_list.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=6, pady=4)
+        _selbtns = ttk.Frame(_pick)
+        _selbtns.grid(row=1, column=0, sticky=tk.W, padx=6, pady=(0, 4))
+        ttk.Button(_selbtns, text="All",
+                   command=lambda: self._diag_select('all')).pack(side=tk.LEFT)
+        ttk.Button(_selbtns, text="None",
+                   command=lambda: self._diag_select('none')).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(_selbtns, text="Quick only",
+                   command=lambda: self._diag_select('quick')).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(_selbtns, text="Invert",
+                   command=lambda: self._diag_select('invert')).pack(side=tk.LEFT, padx=(6, 0))
+        self._diag_estimate = ttk.Label(_selbtns, text="", font=('Arial', 8),
+                                        foreground='gray')
+        self._diag_estimate.pack(side=tk.LEFT, padx=(12, 0))
+        self._diag_sel_vars = {}
+        self._load_devtest_state()
+        try:
+            self._diag_file_lbl.config(
+                text=(getattr(self, 'devtest_scenario_file', '') or "(none selected)"))
+        except Exception:
+            pass
+        self._diag_rebuild_list()
+
+        self._diag_status = ttk.Label(parent, text="Idle", font=('Arial', 9))
+        self._diag_status.grid(row=3, column=0, columnspan=3, sticky=tk.W,
+                               padx=10, pady=(12, 2))
+        self._diag_bar = ttk.Progressbar(parent, mode='determinate', maximum=100)
+        self._diag_bar.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E),
+                            padx=10, pady=(0, 6))
+
+        ttk.Label(parent, text="Progress log", font=('Arial', 9, 'bold')).grid(
+            row=5, column=0, sticky=tk.W, padx=10, pady=(6, 0))
+        _wrap = ttk.Frame(parent)
+        _wrap.grid(row=7, column=0, columnspan=3, sticky=(tk.N, tk.S, tk.W, tk.E),
+                   padx=10, pady=(2, 10))
+        _wrap.columnconfigure(0, weight=1)
+        _wrap.rowconfigure(0, weight=1)
+        # height=6, not 14: a Notebook sizes itself to its TALLEST tab, so a
+        # deep Text here raised the notebook's minimum and squeezed the
+        # terminal below it. The log scrolls, so visible lines cost nothing.
+        self._diag_text = tk.Text(_wrap, height=6, wrap=tk.WORD,
+                                  font=('Consolas', 9))
+        self._diag_text.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.W, tk.E))
+        _sb = ttk.Scrollbar(_wrap, orient=tk.VERTICAL,
+                            command=self._diag_text.yview)
+        _sb.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self._diag_text.config(yscrollcommand=_sb.set, state='disabled')
+
+        ttk.Label(
+            parent,
+            text="Sandboxed run (ysa_dev_config.json + ysa_cache_dev); your real"
+                 " settings and cache are never written to. Keeps running while"
+                 " you use other tabs.",
+            font=('Arial', 8), foreground='gray', justify=tk.LEFT,
+            wraplength=700).grid(row=6, column=0, columnspan=3, sticky=tk.W,
+                                 padx=12, pady=(0, 4))
+
+    def _devtest_state_path(self):
+        return os.path.join(SCRIPT_DIR, 'ysa_devtest_state.json')
+
+    def _load_devtest_state(self):
+        """Diagnostics settings live in their own file.
+
+        They are developer state, not app configuration - keeping them out of
+        ysa_config.json means a non-developer build never carries them and the
+        dev tools can be deleted without leaving orphan keys behind.
+        """
+        try:
+            _p = self._devtest_state_path()
+            if not os.path.isfile(_p):
+                return
+            _st = json.load(open(_p, encoding='utf-8'))
+            self.devtest_scenario_file = str(_st.get('scenario_file', '') or '')
+            _sel = _st.get('selected', [])
+            self.devtest_selected = list(_sel) if isinstance(_sel, list) else []
+        except Exception as e:
+            print('Could not read dev test state: ' + str(e))
+
+    def _save_devtest_state(self):
+        try:
+            json.dump({'scenario_file': getattr(self, 'devtest_scenario_file', ''),
+                       'selected': list(getattr(self, 'devtest_selected', []) or [])},
+                      open(self._devtest_state_path(), 'w', encoding='utf-8'),
+                      indent=2)
+        except Exception as e:
+            print('Could not save dev test state: ' + str(e))
+
+    def _diag_rebuild_list(self):
+        """(Re)build the scenario checklist from the chosen file."""
+        try:
+            for w in self._diag_list.winfo_children():
+                w.destroy()
+        except Exception:
+            return
+        self._diag_sel_vars = {}
+        self._diag_scenarios = []
+        _f = getattr(self, 'devtest_scenario_file', '')
+        if not _f or not os.path.isfile(_f):
+            ttk.Label(self._diag_list, text="(choose a scenario file)",
+                      foreground='gray').grid(row=0, column=0, sticky=tk.W)
+            self._diag_update_estimate()
+            return
+        try:
+            _spec = json.load(open(_f, encoding='utf-8'))
+            _scn = _spec.get('scenarios', []) or []
+            _ph = _spec.get('placeholders', {}) or {}
+        except Exception as e:
+            ttk.Label(self._diag_list, text="Unreadable: " + str(e)[:60],
+                      foreground='red').grid(row=0, column=0, sticky=tk.W)
+            self._diag_update_estimate()
+            return
+        _saved = set(getattr(self, 'devtest_selected', []) or [])
+        _cols = 2
+        for i, sc in enumerate(_scn):
+            _name = sc.get('name', 'scenario ' + str(i + 1))
+            _url = sc.get('url', '')
+            _unset = (_url.startswith('@')
+                      and str(_ph.get(_url[1:], '@')).startswith('@'))
+            _est = int(sc.get('est_sec', 0) or 0)
+            _label = str(i + 1) + '. ' + _name[:46]
+            if _est:
+                _label += '  (~' + (str(_est) + 's' if _est < 90
+                                    else str(round(_est / 60.0, 1)) + 'm') + ')'
+            if _unset:
+                _label += '  [no URL]'
+            # default: everything selected the first time
+            _var = tk.BooleanVar(value=(_name in _saved) if _saved else True)
+            self._diag_sel_vars[_name] = _var
+            self._diag_scenarios.append((_name, _est, _unset))
+            _cb = ttk.Checkbutton(self._diag_list, text=_label, variable=_var,
+                                  command=self._diag_selection_changed)
+            _cb.grid(row=i // _cols, column=i % _cols, sticky=tk.W, padx=(0, 14))
+            if _unset:
+                _var.set(False)
+        self._diag_update_estimate()
+
+    def _diag_select(self, mode):
+        for _name, _est, _unset in getattr(self, '_diag_scenarios', []):
+            _v = self._diag_sel_vars.get(_name)
+            if _v is None:
+                continue
+            if mode == 'all':
+                _v.set(not _unset)
+            elif mode == 'none':
+                _v.set(False)
+            elif mode == 'invert':
+                _v.set(bool(not _v.get()) and not _unset)
+            elif mode == 'quick':
+                # anything under a minute; the long ones are the 20-hour
+                # source, the playlist and the stress run
+                _v.set((0 < _est <= 60) and not _unset)
+        self._diag_selection_changed()
+
+    def _diag_selection_changed(self):
+        self.devtest_selected = [n for n, v in self._diag_sel_vars.items() if v.get()]
+        self._diag_update_estimate()
+        self._save_devtest_state()
+
+    def _diag_update_estimate(self):
+        try:
+            _sel = [(n, e) for n, e, _u in getattr(self, '_diag_scenarios', [])
+                    if self._diag_sel_vars.get(n) is not None
+                    and self._diag_sel_vars[n].get()]
+            _tot = sum(e for _n, e in _sel)
+            _txt = str(len(_sel)) + ' selected'
+            if _tot:
+                _txt += '  -  roughly ' + (str(_tot) + 's' if _tot < 90
+                                           else str(round(_tot / 60.0)) + ' min')
+            self._diag_estimate.config(text=_txt)
+        except Exception:
+            pass
+
+    def _diag_progress(self, msg):
+        """Progress sink for the scenario runner (called from its thread).
+
+        Guarded against the widgets being gone: the panel is a main-window
+        tab now, but the app can still be closing mid-run.
+        """
+        def _apply():
+            try:
+                if not self._diag_status.winfo_exists():
+                    return
+                self._diag_status.config(text=msg)
+                self._diag_text.config(state='normal')
+                self._diag_text.insert(tk.END, time.strftime('%H:%M:%S ') + msg + '\n')
+                self._diag_text.see(tk.END)
+                self._diag_text.config(state='disabled')
+                _m = re.match(r'^\[(\d+)/(\d+)\]', msg)
+                if _m:
+                    self._diag_bar['value'] = (int(_m.group(1)) - 1) * 100.0 / max(1, int(_m.group(2)))
+                elif msg.startswith('Done:'):
+                    self._diag_bar['value'] = 100
+                    self._diag_run_btn.config(state='normal')
+                    self._diag_stop_btn.config(state='disabled')
+            except Exception:
+                pass
+        try:
+            self.root.after(0, _apply)
+        except Exception:
+            pass
+
+    def _diag_run(self):
+        _f = getattr(self, 'devtest_scenario_file', '')
+        if not _f or not os.path.isfile(_f):
+            messagebox.showwarning("Diagnostics", "Choose a scenario file first.")
+            return
+        try:
+            import ysa_devtest
+        except Exception as _e:
+            messagebox.showerror("Diagnostics",
+                                 "ysa_devtest.py could not be imported:\n" + str(_e))
+            return
+        _r = getattr(self, '_devtest_runner', None)
+        if _r is not None and _r.is_running():
+            messagebox.showinfo("Diagnostics", "A run is already in progress.")
+            return
+        try:
+            self._diag_text.config(state='normal')
+            self._diag_text.delete('1.0', tk.END)
+            self._diag_text.config(state='disabled')
+            self._diag_bar['value'] = 0
+            self._diag_run_btn.config(state='disabled')
+            self._diag_stop_btn.config(state='normal')
+        except Exception:
+            pass
+        _only = [n for n, v in getattr(self, '_diag_sel_vars', {}).items() if v.get()]
+        if not _only:
+            messagebox.showwarning("Diagnostics", "No scenarios are selected.")
+            try:
+                self._diag_run_btn.config(state='normal')
+                self._diag_stop_btn.config(state='disabled')
+            except Exception:
+                pass
+            return
+        self._devtest_runner = ysa_devtest.DevTestRunner(
+            self, _f, progress=self._diag_progress, only=_only)
+        self._devtest_runner.start()
+
+    def _diag_stop(self):
+        _r = getattr(self, '_devtest_runner', None)
+        if _r is not None:
+            _r.stop()
+            self._diag_progress("Stop requested - finishing current scenario...")
+    # === END DEV TOOLS ===
+
     # ── Download history panel ─────────────────────────────────────────────
 
     def _setup_history_panel(self, parent):
@@ -1866,6 +2327,21 @@ class YouTubeStreamAnalyzerGUI:
                                     state='readonly', width=12)
         filter_combo.pack(side=tk.LEFT, padx=(0, 4))
         self._history_filter_var.trace_add('write', lambda *_: self._refresh_history_panel())
+
+        # Recording toggle: OFF stops new entries being recorded; existing
+        # history is kept and stays searchable (use Clear History to remove).
+        self._history_enabled_var = tk.BooleanVar(
+            value=bool(getattr(self, 'history_enabled', True)))
+
+        def _on_history_toggle():
+            self.history_enabled = bool(self._history_enabled_var.get())
+            self._save_config_now()
+            self.append_terminal_output(
+                'History recording ' + ('enabled' if self.history_enabled
+                                        else 'disabled') + '.\n', 'info')
+        ttk.Checkbutton(top_bar, text='Record history',
+                        variable=self._history_enabled_var,
+                        command=_on_history_toggle).pack(side=tk.LEFT, padx=(12, 4))
 
         ttk.Button(top_bar, text='Clear History',
                    command=self._clear_download_history).pack(side=tk.RIGHT, padx=(4, 0))
@@ -2270,6 +2746,15 @@ class YouTubeStreamAnalyzerGUI:
         """Update the current progress line in-place using a stored index.
         When called from a background thread, dispatches to the main thread
         at most once every 100 ms to avoid flooding Tkinter's event queue."""
+        # Fan out BEFORE the throttle and the main-thread hop: progress is
+        # written in place by stored index rather than through
+        # append_terminal_output, so listeners never saw it - which left the
+        # dev runner unable to observe download progress at all.
+        for _cb in list(getattr(self, '_output_listeners', ())):
+            try:
+                _cb("Progress: " + progress_line + "\n", 'progress')
+            except Exception:
+                pass
         try:
             if threading.current_thread() != threading.main_thread():
                 now = time.monotonic()
@@ -2326,7 +2811,8 @@ class YouTubeStreamAnalyzerGUI:
         folder; they must never live inside the folder Clear Cache nukes."""
         try:
             # Cache root beside YSA.exe (SCRIPT_DIR handles frozen/script)
-            self.ysa_cache_root = os.path.join(SCRIPT_DIR, "ysa_cache")
+            self.ysa_cache_root = os.path.join(
+                SCRIPT_DIR, getattr(self, "cache_dirname", "ysa_cache"))
             os.makedirs(self.ysa_cache_root, exist_ok=True)
 
             # Single home for ALL temporary operations
@@ -2379,6 +2865,12 @@ class YouTubeStreamAnalyzerGUI:
 
             # Session log (terminal mirror) lives under <ysa_cache>/logs.
             self._open_session_log()
+
+            # Cookie copies left by a previous run (or a crash) are dead once
+            # no yt-dlp is alive - reap them with the same guarded rule.
+            threading.Thread(
+                target=lambda: self._reap_cookie_copies(threshold=1),
+                daemon=True).start()
             
         except (PermissionError, OSError) as e:
             # Fallback - disable caching
@@ -2395,6 +2887,20 @@ class YouTubeStreamAnalyzerGUI:
             self.cache_metadata_file = None
             print(f"Warning: Could not setup cache directories: {e}")
     
+    def _ensure_cache_dirs(self):
+        """Recreate the cache folder if it is missing.
+
+        Clear Cache deletes the folder outright rather than leaving an empty
+        shell behind, so the structure is rebuilt lazily the next time
+        something actually needs it.
+        """
+        try:
+            root = getattr(self, 'ysa_cache_root', None)
+            if root and not os.path.isdir(root):
+                self.setup_cache_directories()
+        except Exception:
+            pass
+
     def _make_temp_dir(self, prefix):
         """Create a temp working directory under <ysa_cache>/tmp.
 
@@ -2402,6 +2908,7 @@ class YouTubeStreamAnalyzerGUI:
         moves into the cache are always same-volume (os.replace safe), and
         Windows temp cleaners can't eat partial downloads. Falls back to the
         system temp folder only if the cache root is unavailable."""
+        self._ensure_cache_dirs()
         base = getattr(self, 'ysa_tmp_dir', None)
         if base:
             try:
@@ -2449,9 +2956,34 @@ class YouTubeStreamAnalyzerGUI:
                         # Stale entry - remove from metadata
                         self.cache_metadata.setdefault('subtitles', {}).get(video_id, {}).pop(cache_key, None)
 
-            # Also count any subtitle files present on disk that aren't in metadata
-            # (e.g. downloaded before this version, or metadata was lost/cleared).
-            # This ensures the cache size label is always accurate on startup.
+            # Orphan-file accounting (below) walks whole cache directories
+            # and stats every file. That is pure size bookkeeping - nothing
+            # downstream needs it to be correct immediately - so it runs in
+            # the background and the size label refreshes when it lands.
+            # The metadata-driven index above stays synchronous because
+            # cache lookups depend on it.
+            def _scan_orphan_sizes():
+              try:
+                self._scan_orphan_cache_sizes()
+              except Exception:
+                pass
+              try:
+                self.root.after(0, self._update_cache_size_label)
+              except Exception:
+                pass
+            threading.Thread(target=_scan_orphan_sizes, daemon=True).start()
+
+        except Exception as e:
+            print("Warning: Could not load cache metadata: " + str(e))
+
+    def _scan_orphan_cache_sizes(self):
+        """Add on-disk files that metadata does not track to the size total.
+
+        Runs on a background thread, so the running total is accumulated
+        locally and applied once under _cache_lock - "+=" on a shared int is
+        not atomic, and downloads writing to the cache can overlap this."""
+        _orphan_total = 0
+        try:
             if self.subtitle_cache_dir and os.path.isdir(self.subtitle_cache_dir):
                 tracked = {
                     fp for subs in self.cached_subtitles.values() for fp in subs.values()
@@ -2460,7 +2992,7 @@ class YouTubeStreamAnalyzerGUI:
                     fpath = os.path.join(self.subtitle_cache_dir, fname)
                     if os.path.isfile(fpath) and fpath not in tracked:
                         try:
-                            self._cache_size_bytes += os.path.getsize(fpath)
+                            _orphan_total += os.path.getsize(fpath)
                         except Exception:
                             pass
 
@@ -2471,7 +3003,7 @@ class YouTubeStreamAnalyzerGUI:
                     fpath = os.path.join(self.thumbnail_cache_dir, fname)
                     if os.path.isfile(fpath):
                         try:
-                            self._cache_size_bytes += os.path.getsize(fpath)
+                            _orphan_total += os.path.getsize(fpath)
                         except Exception:
                             pass
 
@@ -2481,7 +3013,7 @@ class YouTubeStreamAnalyzerGUI:
                     fpath = os.path.join(self.premuxed_cache_dir, fname)
                     if os.path.isfile(fpath):
                         try:
-                            self._cache_size_bytes += os.path.getsize(fpath)
+                            _orphan_total += os.path.getsize(fpath)
                             # Filename pattern: {video_id}_premuxed_{format_id}{ext}
                             stem = os.path.splitext(fname)[0]
                             if '_premuxed_' in stem:
@@ -2520,14 +3052,20 @@ class YouTubeStreamAnalyzerGUI:
                                 self.cached_videos[vid][key] = fpath
                                 # Only add size if this file was not in metadata
                                 if fpath not in already_tracked:
-                                    self._cache_size_bytes += os.path.getsize(fpath)
+                                    _orphan_total += os.path.getsize(fpath)
                         except Exception:
                             pass
 
         except Exception as e:
-            print(f"Warning: Could not load cache metadata: {e}")
-            self.cache_metadata = {}
+            # Size bookkeeping only - never touch cache_metadata here.
+            print("Warning: orphan cache size scan failed: " + str(e))
     
+        try:
+            with self._cache_lock:
+                self._cache_size_bytes += _orphan_total
+        except Exception:
+            self._cache_size_bytes += _orphan_total
+
     def _post_download_cache_maintenance(self):
         """Flush cache metadata to disk and run eviction AFTER download completes.
         This is intentionally deferred so it never runs mid-download or mid-stream."""
@@ -2682,6 +3220,13 @@ class YouTubeStreamAnalyzerGUI:
             return
         self._cleanup_done = True
 
+        # Capture the window box BEFORE anything is torn down, then persist.
+        self._capture_window_geometry()
+        try:
+            self._save_config_now()
+        except Exception:
+            pass
+
         self._close_session_log()
 
         _stop_proxy()
@@ -2812,6 +3357,7 @@ class YouTubeStreamAnalyzerGUI:
     
     def cache_video_stream(self, video_id, format_id, source_path):
         """Cache a video stream for future use"""
+        self._ensure_cache_dirs()   # Clear Cache may have removed it
         if not self.video_cache_dir or not os.path.exists(source_path):
             return None
         
@@ -2872,6 +3418,7 @@ class YouTubeStreamAnalyzerGUI:
 
     def cache_audio_stream(self, video_id, format_id, source_path):
         """Cache an audio stream for future use."""
+        self._ensure_cache_dirs()   # Clear Cache may have removed it
         if not self.audio_cache_dir or not os.path.exists(source_path):
             return None
         try:
@@ -2939,6 +3486,7 @@ class YouTubeStreamAnalyzerGUI:
             return None
         if not os.path.exists(source_path):
             return None
+        self._ensure_cache_dirs()
         try:
             cache_filename = video_id + "_mp3_" + audio_format_id + ".mp3"
             cache_path = os.path.join(self.mp3_cache_dir, cache_filename)
@@ -3005,6 +3553,7 @@ class YouTubeStreamAnalyzerGUI:
         Flush to disk is deferred to _post_download_cache_maintenance() so it
         never races with a parallel download writing the same metadata file.
         """
+        self._ensure_cache_dirs()   # Clear Cache may have removed it
         if not self.subtitle_cache_dir or not os.path.exists(source_path):
             return None
         try:
@@ -3298,6 +3847,12 @@ class YouTubeStreamAnalyzerGUI:
             raise Exception(f"yt-dlp command timed out after {timeout} seconds")
         except Exception as e:
             raise Exception(f"Failed to run yt-dlp: {str(e)}")
+        finally:
+            # The info cascade runs through here, not through the terminal
+            # runner - without this its per-invocation cookie copies were
+            # never reclaimed and piled up in <cache>/tmp all session.
+            # cookie copies are reclaimed only by the process-guarded reap
+            pass
     
 
     # ── bgutil PO Token provider ────────────────────────────────────────────
@@ -3363,7 +3918,7 @@ class YouTubeStreamAnalyzerGUI:
             import json as _json
             url = (getattr(self, 'bgutil_server_url', '') or 'http://127.0.0.1:4416').rstrip('/')
             req = _ur.Request(url + '/ping', method='GET')
-            with _ur.urlopen(req, timeout=2) as resp:
+            with _ur.urlopen(req, timeout=0.6) as resp:
                 if resp.status != 200:
                     self._bgutil_server_version = None
                     return False
@@ -3385,7 +3940,7 @@ class YouTubeStreamAnalyzerGUI:
                     _h, _p = url.split('//')[-1].rsplit(':', 1)
                     host = _h.strip('/')
                     port = int(_p.strip('/'))
-                s = _sock.create_connection((host, port), timeout=2)
+                s = _sock.create_connection((host, port), timeout=0.6)
                 s.close()
                 return True
             except Exception:
@@ -3905,11 +4460,97 @@ class YouTubeStreamAnalyzerGUI:
         cookies land in the throwaway and the master is never opened for
         write by anyone. Falls back to the master path if copying fails."""
         try:
+            # Reap BEFORE making the new copy. Reaping afterwards deleted the
+            # copy that had just been created: the yt-dlp process it belongs
+            # to has not spawned yet, so the "is anything running?" probe
+            # answers no and every copy looks dead. Field symptom was
+            # 'Reclaimed N finished cookie copies' immediately followed by
+            # FileNotFoundError on the copy for the command about to run.
+            self._reap_cookie_copies()
             _dst = os.path.join(self._make_temp_dir('ysa_ck_'), 'cookies.txt')
             shutil.copy2(master_path, _dst)
             return _dst
         except Exception:
             return master_path
+
+    def _any_ytdlp_running(self):
+        """True if any yt-dlp process is alive - or if we cannot tell.
+
+        Deliberately fails CLOSED: any error, any unknown platform, any
+        ambiguity answers True, because the cost of a wrong 'no' is deleting
+        a cookie file out from under a running download.
+        """
+        try:
+            # normalise separators so the image name is correct however
+            # the path was written (and so this is testable off-Windows)
+            _img = os.path.basename(
+                str(self.ytdlp_path or 'yt-dlp.exe').replace('\\', '/'))
+            if sys.platform == 'win32':
+                _r = subprocess.run(
+                    ['tasklist', '/FI', 'IMAGENAME eq ' + _img, '/NH'],
+                    capture_output=True, text=True, encoding='utf-8',
+                    errors='replace', timeout=10,
+                    creationflags=CREATE_NO_WINDOW)
+                if _r.returncode != 0:
+                    return True
+                return _img.lower() in (_r.stdout or '').lower()
+            _r = subprocess.run(['pgrep', '-f', _img], capture_output=True,
+                                text=True, encoding='utf-8', errors='replace',
+                                timeout=10)
+            return _r.returncode == 0
+        except Exception:
+            return True
+
+    def _reap_cookie_copies(self, threshold=25):
+        """Remove throwaway cookie folders, but ONLY when nothing can be using them.
+
+        An earlier version kept the newest N folders and deleted the rest on
+        every new copy. That assumed at most a handful of concurrent yt-dlp
+        processes; a real batch run (queue + four pre-cache slots + clipboard
+        analyses) blows past that, and a LONG download's folder ages out of
+        the window while still in use. The result was
+        'FileNotFoundError: ...ysa_ck_XXXX/cookies.txt' mid-run - recoverable,
+        because the retry logic caught it, but self-inflicted.
+
+        Deleting on a timer is unsafe for the same reason, so the only sound
+        rule is to ask the OS: if no yt-dlp process exists, every copy is
+        dead and all of them can go. If one exists, nothing is touched.
+        """
+        # Only one reaper at a time: two threads both passed the idle check
+        # and both deleted the same set ("Reclaimed 27..." printed twice).
+        if not self._ck_reap_lock.acquire(blocking=False):
+            return
+        try:
+            base = getattr(self, 'ysa_tmp_dir', None)
+            if not base or not os.path.isdir(base):
+                return
+            dirs = [os.path.join(base, d) for d in os.listdir(base)
+                    if d.startswith('ysa_ck_')]
+            dirs = [d for d in dirs if os.path.isdir(d)]
+            if len(dirs) < threshold:
+                return
+            # A copy younger than this may belong to a command that has been
+            # built but whose process has not started yet - invisible to the
+            # process probe. Never touch those.
+            _now = time.time()
+            dirs = [d for d in dirs
+                    if (_now - os.path.getmtime(d)) > 120]
+            if not dirs:
+                return
+            if self._any_ytdlp_running():
+                return
+            for _d in dirs:
+                shutil.rmtree(_d, ignore_errors=True)
+            self.append_terminal_output(
+                'Reclaimed ' + str(len(dirs)) + ' finished cookie copies.\n',
+                'cache')
+        except Exception:
+            pass
+        finally:
+            try:
+                self._ck_reap_lock.release()
+            except Exception:
+                pass
 
     def get_ytdlp_cookies_args(self):
         """Return cookie args for yt-dlp.
@@ -3956,6 +4597,15 @@ class YouTubeStreamAnalyzerGUI:
                     exported = self._export_firefox_cookies_to_file()
                     if exported:
                         return ['--cookies', self._cookies_copy_for_invocation(exported)]
+                    if not getattr(self, '_ff_export_warned', False):
+                        self._ff_export_warned = True
+                        self.append_terminal_output(
+                            "Firefox cookie export failed - modern Firefox keeps"
+                            " its cookie store locked/encrypted while running.\n"
+                            "Use the 'cookies.txt' browser add-on instead:"
+                            " open a private window, sign in to YouTube, export"
+                            " cookies.txt, then point Settings > Cookies at that"
+                            " file.\n", 'warning')
                 except Exception:
                     pass
             return ['--cookies-from-browser', browser]
@@ -4005,7 +4655,11 @@ class YouTubeStreamAnalyzerGUI:
             return None
 
         # Export to Netscape cookie format that yt-dlp understands
-        out_dir  = self.yt_dlp_cache_dir if self.yt_dlp_cache_dir else tempfile.gettempdir()
+        # Keep this inside the app's own folder - falling back to the Windows
+        # temp dir scattered cookie exports outside ysa_cache.
+        self._ensure_cache_dirs()
+        out_dir = (self.yt_dlp_cache_dir or getattr(self, 'ysa_tmp_dir', None)
+                   or tempfile.gettempdir())
         out_path = os.path.join(out_dir, 'ysa_ff_cookies.txt')
         try:
             con = _sqlite3.connect('file:' + tmp_db + '?mode=ro&immutable=1',
@@ -4227,6 +4881,20 @@ class YouTubeStreamAnalyzerGUI:
             self.root.after(0, lambda e=err_short:
                 self.append_terminal_output('  -> ' + e + '\n', 'warning'))
 
+            # Stop immediately when the video is gone for good. Every client
+            # gets the same answer, so the remaining attempts only burn
+            # requests - noticeable on a playlist where several entries
+            # belong to a terminated channel.
+            _low = stderr.lower()
+            _terminal = next((t for t in _YT_TERMINAL_ERRORS if t in _low), None)
+            if _terminal:
+                self.root.after(0, lambda:
+                    self.append_terminal_output(
+                        '  -> video is permanently unavailable - skipping the'
+                        ' remaining ' + str(len(attempts) - attempt_num)
+                        + ' attempt(s).\n', 'warning'))
+                raise Exception('Video unavailable: ' + err_short)
+
         # All attempts failed - raise with the most informative error
         for r in ([last_result] if last_result else []):
             detail = (r.stderr or '').strip() or (r.stdout or '').strip()
@@ -4245,7 +4913,9 @@ class YouTubeStreamAnalyzerGUI:
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(6, weight=1)
-        main_frame.rowconfigure(9, weight=1)
+        main_frame.rowconfigure(9, weight=1, minsize=180)   # terminal floor:
+        # a Notebook sizes to its tallest tab, so without this any new
+        # tab can squeeze the terminal down to nothing.
         
         # Bind keyboard shortcuts
         self.root.bind('<Control-v>', lambda e: self.paste_and_analyze())
@@ -4782,6 +5452,18 @@ class YouTubeStreamAnalyzerGUI:
         self.notebook.add(self.history_frame, text="📜 History")
         self._setup_history_panel(self.history_frame)
 
+        # === BEGIN DEV TOOLS ===
+        # Diagnostics lives on the MAIN notebook rather than inside Settings:
+        # a run takes many minutes, and the Settings dialog is modal-ish and
+        # disposable - closing it left the progress callback writing to a
+        # destroyed label. As a tab it can be left running in the background
+        # while other tabs are used, and switching back shows live progress.
+        if DEV_MODE:
+            self.diag_frame = ttk.Frame(self.notebook)
+            self.notebook.add(self.diag_frame, text="🧪 Diagnostics")
+            self._setup_diagnostics_panel(self.diag_frame)
+        # === END DEV TOOLS ===
+
         # ── Button row 1: action buttons ─────────────────────────────────────
         button_frame = ttk.Frame(main_frame)
         button_frame.grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 2))
@@ -4859,6 +5541,8 @@ class YouTubeStreamAnalyzerGUI:
         # configured cookie file/browser in Settings.
         self._cookies_enabled_var = tk.BooleanVar(value=getattr(self, 'cookies_enabled', True))
         self._mk_var_mirror(self._cookies_enabled_var, '_m_cookies_on', bool)
+        if hasattr(self, '_history_enabled_var'):
+            self._mk_var_mirror(self._history_enabled_var, '_m_history_on', bool)
         self.cookies_cb = ttk.Checkbutton(
             toggle_frame, text="Cookies",
             variable=self._cookies_enabled_var,
@@ -4869,8 +5553,8 @@ class YouTubeStreamAnalyzerGUI:
         # Revealed by the "Clip" checkbox.  Start/End accept HH:MM:SS, MM:SS,
         # raw seconds, or decimal seconds (e.g. 00:00:01.5).
         self._clip_enabled_var = tk.BooleanVar(value=False)
-        self._clip_start_var   = tk.StringVar(value='00:00:00')
-        self._clip_end_var     = tk.StringVar(value='00:00:00')
+        self._clip_start_var   = tk.StringVar(value='00:00:00.00')
+        self._clip_end_var     = tk.StringVar(value='00:00:00.00')
         self._mk_var_mirror(self._clip_enabled_var, '_m_clip_on', bool)
         self._mk_var_mirror(self._clip_start_var, '_m_clip_start', str)
         self._mk_var_mirror(self._clip_end_var, '_m_clip_end', str)
@@ -4880,8 +5564,8 @@ class YouTubeStreamAnalyzerGUI:
             self._clip_start_entry_w.config(state=_state)
             self._clip_end_entry_w.config(state=_state)
             if not self._clip_enabled_var.get():
-                self._clip_start_var.set('00:00:00')
-                self._clip_end_var.set('00:00:00')
+                self._clip_start_var.set('00:00:00.00')
+                self._clip_end_var.set('00:00:00.00')
         # Store so preview can call it from root.after
         self._on_clip_toggle_fn = _on_clip_toggle
 
@@ -4891,12 +5575,26 @@ class YouTubeStreamAnalyzerGUI:
 
         ttk.Label(toggle_frame, text='Start:').pack(side=tk.LEFT, padx=(2, 1))
         self._clip_start_entry_w = ttk.Entry(toggle_frame, textvariable=self._clip_start_var,
-                                      width=11, state='disabled')
+                                      width=13, state='disabled')
         self._clip_start_entry_w.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Label(toggle_frame, text='End:').pack(side=tk.LEFT, padx=(0, 1))
         self._clip_end_entry_w = ttk.Entry(toggle_frame, textvariable=self._clip_end_var,
-                                    width=11, state='disabled')
+                                    width=13, state='disabled')
         self._clip_end_entry_w.pack(side=tk.LEFT, padx=(0, 2))
+
+        def _normalise_clip_field(var):
+            """Reformat a clip field to HH:MM:SS.ss when focus leaves it, so
+            '90.5' or '1:30' become the canonical form and the precision the
+            downloader will actually use is what the user sees."""
+            def _handler(_e=None):
+                _v = self._parse_time_to_hhmmss(var.get())
+                if _v:
+                    var.set(_v)
+            return _handler
+        self._clip_start_entry_w.bind('<FocusOut>', _normalise_clip_field(self._clip_start_var))
+        self._clip_end_entry_w.bind('<FocusOut>', _normalise_clip_field(self._clip_end_var))
+        self._clip_start_entry_w.bind('<Return>', _normalise_clip_field(self._clip_start_var))
+        self._clip_end_entry_w.bind('<Return>', _normalise_clip_field(self._clip_end_var))
 
         # Terminal + queue share a 2-col bottom container.
         # setup_terminal_output creates _bottom_container first;
@@ -5018,11 +5716,12 @@ class YouTubeStreamAnalyzerGUI:
             time.sleep(0.5)
 
             shutil.rmtree(self.ysa_cache_root, ignore_errors=True)
-            _leftover = os.path.isdir(self.ysa_cache_root) and \
-                        bool(os.listdir(self.ysa_cache_root))
+            _leftover = os.path.isdir(self.ysa_cache_root)
 
-            # Recreate the structure and reset ALL in-memory state
-            self.setup_cache_directories()
+            # The folder is deliberately NOT recreated here: "clear the cache"
+            # should leave nothing on disk, not an empty shell. The structure
+            # is rebuilt by _ensure_cache_dirs the next time a download or a
+            # cache write needs it.
             self.cached_videos = {}
             self.cached_subtitles = {}
             self.cached_premuxed = {}
@@ -5032,20 +5731,19 @@ class YouTubeStreamAnalyzerGUI:
                 self._precache_completed_ids.clear()
             self.cache_metadata = {'videos': {}, 'subtitles': {}}
             self.save_cache_metadata()
-            if hasattr(self, '_open_session_log'):
-                try:
-                    self._open_session_log()
-                except Exception:
-                    pass
+            # (setup_cache_directories above already reopened the session
+            # log; calling it again here created a second, empty log file.)
 
             if _leftover:
                 self.append_terminal_output(
-                    "Cache cleared (a few locked files could not be removed"
-                    " and will be swept on next exit).\n", 'warning')
+                    "Cache cleared, but the folder could not be fully removed"
+                    " - a few files are locked and will be swept on next"
+                    " exit.\n", 'warning')
             else:
                 self.append_terminal_output(
-                    "Cache folder deleted and recreated - all categories"
-                    " cleared.\n", 'success')
+                    "Cache folder deleted. It will be recreated automatically"
+                    " on the next download (session logging resumes then).\n",
+                    'success')
             messagebox.showinfo("Cache", "Cache cleared")
             self.status_var.set("Cache cleared")
             self.root.after(0, self._update_cache_size_label)
@@ -6188,6 +6886,16 @@ class YouTubeStreamAnalyzerGUI:
             """Return best stream from pool, respecting bitrate preference."""
             if not pool:
                 return None
+            # DRC variants (format ids like '249-drc') are YouTube's
+            # loudness-compressed renditions - audibly flatter than the
+            # normal stream, so they are avoided unless asked for.
+            _drc = getattr(self, 'audio_drc_pref', 'avoid')
+            if _drc in ('avoid', 'prefer'):
+                _want_plain = (_drc == 'avoid')
+                _sub = [s for s in pool
+                        if ('drc' not in str(s.get('format_id', '')).lower()) == _want_plain]
+                if _sub:
+                    pool = _sub
             limit = getattr(self, 'preferred_audio_bitrate', 0)
             if limit and limit > 0:
                 under = [s for s in pool if (s.get('abr') or 0) <= limit]
@@ -6596,8 +7304,8 @@ Total Streams: {len(self.current_formats)}"""
         # Reset clip fields
         if hasattr(self, '_clip_enabled_var'):
             self._clip_enabled_var.set(False)
-            self._clip_start_var.set('00:00:00')
-            self._clip_end_var.set('00:00:00')
+            self._clip_start_var.set('00:00:00.00')
+            self._clip_end_var.set('00:00:00.00')
             _fn = getattr(self, '_on_clip_toggle_fn', None)
             if _fn:
                 _fn()
@@ -7654,7 +8362,17 @@ Total Streams: {len(self.current_formats)}"""
             row=3, column=1, columnspan=2, sticky=tk.W, padx=8, pady=(8, 2))
 
         def _refresh_bgutil_status():
-            self._bgutil_refresh_status(update_ui=True)
+            # Off the main thread: this probes an HTTP endpoint and then a
+            # raw TCP port. When the server is not running (the common case)
+            # a firewall that DROPS rather than refuses makes both wait out
+            # their timeouts, freezing the dialog as it opens.
+            try:
+                self._bgutil_status_label.config(text="Checking...")
+            except Exception:
+                pass
+            threading.Thread(
+                target=lambda: self._bgutil_refresh_status(update_ui=True),
+                daemon=True).start()
 
         ttk.Button(tab_bgutil, text="Refresh", command=_refresh_bgutil_status).grid(
             row=3, column=3, sticky=tk.W, padx=4, pady=(8, 2))
@@ -7974,8 +8692,193 @@ Total Streams: {len(self.current_formats)}"""
         tab_bgutil.bind('<Visibility>', lambda e: _refresh_bgutil_status())
         self.root.after(600, _refresh_bgutil_status)
 
-        # ── Register tabs in display order: Downloads, Cache, Executables, bgutil ──
+        # ── Audio tab: how audio-only downloads are encoded and named ────
+        tab_audio = ttk.Frame(notebook)
+        tab_audio.columnconfigure(1, weight=1)
+        _a_row = [0]
+
+        def _a_next():
+            _a_row[0] += 1
+            return _a_row[0]
+
+        def _a_hint(text):
+            ttk.Label(tab_audio, text=text, font=('Arial', 8),
+                      foreground='gray', justify=tk.LEFT, wraplength=560).grid(
+                row=_a_next(), column=0, columnspan=3, sticky=tk.W, padx=14,
+                pady=(0, 2))
+
+        def _a_combo(label, attr, choices, default, hint=''):
+            """choices: list of (display_text, stored_value)."""
+            r = _a_next()
+            ttk.Label(tab_audio, text=label).grid(
+                row=r, column=0, sticky=tk.W, padx=10, pady=(8, 0))
+            _disp = [c[0] for c in choices]
+            _cur = getattr(self, attr, default)
+            _sel = next((c[0] for c in choices if c[1] == _cur), _disp[0])
+            _var = tk.StringVar(value=_sel)
+            _cb = ttk.Combobox(tab_audio, textvariable=_var, values=_disp,
+                               state='readonly', width=36)
+            _cb.grid(row=r, column=1, sticky=tk.W, padx=10, pady=(8, 0))
+
+            def _on(_e=None, a=attr, c=choices, v=_var):
+                for _d, _val in c:
+                    if _d == v.get():
+                        setattr(self, a, _val)
+                        break
+                self._save_config_now()
+            _cb.bind('<<ComboboxSelected>>', _on)
+            if hint:
+                _a_hint(hint)
+            return _var
+
+        _a_combo("When the stream is Opus:", 'audio_opus_naming', [
+            ("Name by actual codec (.webm/.opus)", 'codec'),
+            ("Force .m4a extension", 'm4a'),
+            ("Remux into a real M4A container", 'remux'),
+            ("Prefer a real AAC stream instead", 'prefer_aac'),
+        ], 'codec',
+            "M4A Native wrote every stream to .m4a regardless of codec, so an"
+            " Opus pick became an .m4a that iTunes, iOS and many car stereos"
+            " refuse to play. Naming by codec keeps the file honest.")
+
+        _a_combo("Transcode output bitrate:", 'audio_bitrate_policy', [
+            ("Match source - never upsample", 'match_source'),
+            ("Match my preferred bitrate", 'match_pref'),
+            ("Fixed bitrate (below)", 'fixed'),
+            ("Maximum quality (old behaviour)", 'max'),
+        ], 'match_source',
+            "Encoders were hardcoded (AAC 128k, MP3 V0), so picking the"
+            " smallest source stream then transcoding produced files about"
+            " 2.5x LARGER than the stream they came from, with no quality"
+            " gain. Nothing can restore detail already lost in the source.")
+
+        _r = _a_next()
+        ttk.Label(tab_audio, text="Fixed bitrate (kbps):").grid(
+            row=_r, column=0, sticky=tk.W, padx=10, pady=(8, 0))
+        _fb_var = tk.StringVar(value=str(getattr(self, 'audio_fixed_bitrate', 128)))
+
+        def _on_fixed_bitrate(*_a):
+            try:
+                self.audio_fixed_bitrate = max(32, min(320, int(_fb_var.get())))
+            except Exception:
+                return
+            self._save_config_now()
+        _fb_spin = ttk.Spinbox(tab_audio, from_=32, to=320, increment=16,
+                               textvariable=_fb_var, width=8,
+                               command=_on_fixed_bitrate)
+        _fb_spin.grid(row=_r, column=1, sticky=tk.W, padx=10, pady=(8, 0))
+        _fb_spin.bind('<FocusOut>', _on_fixed_bitrate)
+
+        _a_combo("Loudness-compressed (DRC) streams:", 'audio_drc_pref', [
+            ("Avoid DRC variants", 'avoid'),
+            ("Allow either", 'allow'),
+            ("Prefer DRC variants", 'prefer'),
+        ], 'avoid',
+            "YouTube offers '-drc' renditions that are loudness-flattened and"
+            " audibly different from the normal stream.")
+
+        _a_combo("Quality tag on audio filenames:", 'audio_quality_tag', [
+            ("Audio bitrate (e.g. 48kbps)", 'audio'),
+            ("Video quality (e.g. 720p)", 'video'),
+            ("No quality tag", 'none'),
+        ], 'audio',
+            "Audio-only downloads fetch the same stream at every video"
+            " quality, so a [720p] tag implied a difference that did not"
+            " exist - two identically-sized files with different names.")
+
+        _a_combo("If no AAC stream exists (M4A AAC):", 'audio_no_aac_action', [
+            ("Transcode from Opus", 'transcode'),
+            ("Keep the Opus stream as-is", 'keep_opus'),
+            ("Fail with a message", 'skip'),
+        ], 'transcode',
+            "Some videos publish no AAC audio at all, so AAC mode always"
+            " transcodes for them - which costs time and enlarges the file.")
+
+        _a_combo("Duplicate output files:", 'audio_duplicate_action', [
+            ("Number them: name (2).m4a", 'number'),
+            ("Overwrite the existing file", 'overwrite'),
+            ("Skip - keep the existing file", 'skip'),
+        ], 'number')
+
+        _r = _a_next()
+        _cache_audio_var = tk.BooleanVar(
+            value=bool(getattr(self, 'audio_cache_streams', True)))
+
+        def _on_cache_audio():
+            self.audio_cache_streams = bool(_cache_audio_var.get())
+            self._save_config_now()
+        ttk.Checkbutton(tab_audio,
+                        text="Cache audio streams from audio-only downloads",
+                        variable=_cache_audio_var,
+                        command=_on_cache_audio).grid(
+            row=_r, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(10, 0))
+        _a_hint("Without this the same audio is re-fetched every time - field"
+                " logs show one stream pulled eight times in a single session.")
+
+        _r = _a_next()
+        ttk.Label(tab_audio, text="Audio output folder:").grid(
+            row=_r, column=0, sticky=tk.W, padx=10, pady=(10, 0))
+        _af_lbl = ttk.Label(
+            tab_audio,
+            text=(getattr(self, 'audio_output_folder', '') or "(same as Download Folder)"),
+            foreground='gray')
+        _af_lbl.grid(row=_r, column=1, sticky=tk.W, padx=10, pady=(10, 0))
+
+        def _pick_audio_folder():
+            _d = filedialog.askdirectory(title="Choose audio output folder")
+            if _d:
+                self.audio_output_folder = _d
+                _af_lbl.config(text=_d)
+                self._save_config_now()
+
+        def _clear_audio_folder():
+            self.audio_output_folder = ''
+            _af_lbl.config(text="(same as Download Folder)")
+            self._save_config_now()
+        _r2 = _a_next()
+        ttk.Button(tab_audio, text="Browse...", command=_pick_audio_folder).grid(
+            row=_r2, column=0, sticky=tk.W, padx=10, pady=(2, 0))
+        ttk.Button(tab_audio, text="Use download folder",
+                   command=_clear_audio_folder).grid(
+            row=_r2, column=1, sticky=tk.W, padx=10, pady=(2, 0))
+
+        # ── Interface tab ─────────────────────────────────────────────────
+        tab_iface = ttk.Frame(notebook)
+        tab_iface.columnconfigure(1, weight=1)
+        _rw_var = tk.BooleanVar(value=bool(getattr(self, 'remember_window', True)))
+
+        def _on_remember_window():
+            self.remember_window = bool(_rw_var.get())
+            if not self.remember_window:
+                self.window_geometry = ''
+                self.window_maximized = False
+            self._save_config_now()
+        ttk.Checkbutton(tab_iface,
+                        text="Remember window size and position",
+                        variable=_rw_var, command=_on_remember_window).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, padx=10, pady=(12, 2))
+        ttk.Label(tab_iface,
+                  text="Saved when YSA closes and restored on the next start."
+                       " A position that would land off-screen (for example a"
+                       " monitor that is no longer connected) is re-centred"
+                       " automatically.",
+                  font=('Arial', 8), foreground='gray', justify=tk.LEFT,
+                  wraplength=560).grid(
+            row=1, column=0, columnspan=3, sticky=tk.W, padx=14)
+        ttk.Button(tab_iface, text="Reset window size and position",
+                   command=self._reset_window_geometry).grid(
+            row=2, column=0, sticky=tk.W, padx=10, pady=(10, 0))
+
+        ttk.Label(tab_iface,
+                  text="History recording is toggled on the History tab.",
+                  font=('Arial', 8), foreground='gray').grid(
+            row=3, column=0, columnspan=3, sticky=tk.W, padx=14, pady=(16, 0))
+
+
+        # ── Register tabs in display order ────────────────────────────────
         notebook.add(_tab_dl_outer, text="Downloads")
+        notebook.add(tab_audio,  text="Audio")
+        notebook.add(tab_iface,  text="Interface")
         notebook.add(tab_cache,  text="Cache")
         notebook.add(tab_exe,    text="Executables")
         notebook.add(tab_bgutil, text="bgutil (PO Token)")
@@ -8151,8 +9054,9 @@ Total Streams: {len(self.current_formats)}"""
     def _precache_init(self):
         """Initialise or resize the slot pool to match precache_concurrent_count.
         Safe to call multiple times - dynamically resizes when the setting changes."""
-        if not hasattr(self, '_precache_lock'):
-            self._precache_lock = threading.Lock()
+        # _precache_lock is created in __init__ (two threads reaching a
+        # lazy hasattr-check together each made their own lock)
+        pass
         if not hasattr(self, '_precache_active_ids'):
             self._precache_active_ids = set()
         if not hasattr(self, '_precache_completed_ids'):
@@ -8811,6 +9715,8 @@ Total Streams: {len(self.current_formats)}"""
         _vid_id_for_cache = video_id or (video_info.get('id') if video_info else None) or 'unknown'
         _premuxed_vkey = self._premuxed_cache_key(format_id)
         _cached_base = self.get_cached_premuxed_path(_vid_id_for_cache, _premuxed_vkey)
+        # premuxed reuse reads a cached file too - protect it from eviction
+        self._mark_cache_inuse(_cached_base)
         _from_cache = False
 
         if _cached_base:
@@ -8867,6 +9773,19 @@ Total Streams: {len(self.current_formats)}"""
                             " for " + quality + " (" + retry_note + ")...\n", 'warning')
                         if wait_secs:
                             time.sleep(wait_secs)
+                        if 'HTTP Error 416' in _last_exc_str:
+                            # Premuxed downloads had the fast classifier but no
+                            # salvage, so a byte-complete file that crashed at
+                            # exit looped all five attempts. Expected size is
+                            # passed as 0 deliberately: this path has no second
+                            # leg to protect, so deleting and refetching always
+                            # converges, which matters more than saving bytes.
+                            try:
+                                # the direct worker writes straight to the
+                                # final path, so that IS the partial
+                                self._resolve_416_partial(output_path, 0, 'Stream')
+                            except Exception:
+                                pass
                     else:
                         self.append_terminal_output("\nStarting download: " + quality + " quality\n", 'info')
                         self.root.after(0, lambda: self.progress_bar.start())
@@ -9307,15 +10226,115 @@ Total Streams: {len(self.current_formats)}"""
         self.root.after(0, lambda: self._download_complete(output_path, 'Download', download_time))
 
     def _expected_stream_size(self, video_info, format_id):
-        """Exact filesize for a format id from the analysis we already hold,
-        or 0 when yt-dlp only reported an approximation/nothing."""
+        """Expected byte size of a format, from the analysis we already hold.
+
+        Prefers the exact filesize. Falls back to filesize_approx with a 2%
+        margin so formats that only report an estimate (some HLS-derived
+        entries) can still have a complete partial recognised instead of
+        being thrown away and re-downloaded. Returns 0 when neither is
+        known, which callers treat as 'cannot verify'."""
         try:
             for f in (video_info or {}).get('formats', []):
                 if str(f.get('format_id', '')) == str(format_id):
-                    return int(f.get('filesize') or 0)
+                    _exact = int(f.get('filesize') or 0)
+                    if _exact:
+                        return _exact
+                    _approx = int(f.get('filesize_approx') or 0)
+                    if _approx:
+                        return int(_approx * 0.98)
+                    return 0
         except Exception:
             pass
         return 0
+
+    def _audio_source_abr(self, video_info, format_id):
+        """Average bitrate (kbps) of a format from the analysis, or 0."""
+        try:
+            for f in (video_info or {}).get('formats', []):
+                if str(f.get('format_id', '')) == str(format_id):
+                    return int(float(f.get('abr') or 0))
+        except Exception:
+            pass
+        return 0
+
+    def _audio_output_bitrate(self, source_abr):
+        """Encoder bitrate for a transcode, per the user's policy.
+
+        The output encoders were hardcoded (AAC at 128k, MP3 at LAME V0), so
+        asking for the smallest source stream and then transcoding produced
+        files ~2.5x LARGER than the stream they came from, with no quality
+        gain - nothing can restore detail already lost in a 48 kbps Opus
+        encode. Returns 0 to mean 'encoder default' (the old behaviour,
+        kept as the 'max' policy)."""
+        policy = getattr(self, 'audio_bitrate_policy', 'match_source')
+        pref = int(getattr(self, 'preferred_audio_bitrate', 0) or 0)
+        src = int(source_abr or 0)
+        if policy == 'max':
+            return 0
+        if policy == 'fixed':
+            want = int(getattr(self, 'audio_fixed_bitrate', 128) or 128)
+        elif policy == 'match_pref':
+            want = pref or src or 128
+        else:
+            want = src or pref or 128
+        if src:
+            want = min(want, src)          # never upsample past the source
+        return max(32, min(320, int(want)))
+
+    def _cache_raw_audio_stream(self, video_id, format_id, src_path):
+        """Copy a freshly downloaded RAW audio stream into the audio cache.
+
+        The audio-only worker consumed the audio cache but never filled it,
+        so repeat downloads of the same audio re-fetched from the network
+        every time - field logs show one 11.8 MiB stream pulled eight times
+        in a single session. Copies rather than moves so the caller's
+        pipeline is untouched; cache_audio_stream then moves the copy into
+        place, reusing its registration, metadata and size accounting.
+
+        Must never be called for clipped or transcoded audio: a cache entry
+        keyed on a format id has to be the complete, unmodified stream."""
+        if not getattr(self, 'audio_cache_streams', True):
+            return
+        if not video_id or not format_id or not getattr(self, 'audio_cache_dir', None):
+            return
+        try:
+            if self.get_cached_audio_path(video_id, format_id):
+                return
+            _ext = os.path.splitext(src_path)[1] or '.m4a'
+            _stage = os.path.join(os.path.dirname(src_path), 'cachestage' + _ext)
+            shutil.copy2(src_path, _stage)
+            if self.cache_audio_stream(video_id, format_id, _stage):
+                self.append_terminal_output(
+                    'Audio stream cached for reuse.\n', 'cache')
+            else:
+                try:
+                    os.remove(_stage)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _cleanup_invocation_cookies(self, args):
+        """Delete the throwaway cookie copy made for one yt-dlp invocation.
+
+        Copies are created per invocation and were only swept at exit, so a
+        long session left hundreds of ysa_ck_* folders behind. Deleting them
+        on a timer would be unsafe (yt-dlp writes its cookie jar back at
+        EXIT, so removing the file mid-run recreates the very crash the
+        copies prevent), so removal is tied to the process actually being
+        finished: the caller passes the args it just ran."""
+        try:
+            base = getattr(self, 'ysa_tmp_dir', None)
+            if not base or not args:
+                return
+            for _i, _a in enumerate(args):
+                if _a == '--cookies' and _i + 1 < len(args):
+                    _d = os.path.dirname(str(args[_i + 1]))
+                    if (os.path.basename(_d).startswith('ysa_ck_')
+                            and os.path.dirname(_d) == base):
+                        shutil.rmtree(_d, ignore_errors=True)
+        except Exception:
+            pass
 
     def _resolve_leg_file(self, path_template):
         """Turn a yt-dlp -o template (video_137.%(ext)s) into the actual file
@@ -9526,7 +10545,16 @@ Total Streams: {len(self.current_formats)}"""
                 # yt-dlp for it again: -c on a byte-complete file makes
                 # googlevideo answer HTTP 416. Treat the leg as cached-in-
                 # place; it feeds the merge directly this attempt.
-                if not cached_video_path:
+                # NOTE: the download branches below are gated on
+                # video_cached / audio_cached, so a salvaged leg needs its
+                # own flag - setting cached_video_path alone left the video
+                # leg re-spawning yt-dlp against a byte-complete file and
+                # looping on 416 exactly as before the fix. The salvage
+                # flags deliberately do NOT set *_cached, so the caching
+                # step further down still stores the recovered stream.
+                _v_salv = False
+                _a_salv = False
+                if not video_cached:
                     _vexp = self._expected_stream_size(video_info, video_format_id)
                     _vgot = self._resolve_leg_file(video_temp)
                     if _vgot and _vexp and os.path.getsize(_vgot) >= _vexp:
@@ -9534,8 +10562,8 @@ Total Streams: {len(self.current_formats)}"""
                             'Video stream already complete from a previous'
                             ' attempt (size verified) - skipping download.\n',
                             'success')
-                        cached_video_path = _vgot
                         video_temp = _vgot
+                        _v_salv = True
                 if not audio_cached:
                     _aexp = self._expected_stream_size(video_info, audio_format_id)
                     _agot = self._resolve_leg_file(audio_temp)
@@ -9544,15 +10572,19 @@ Total Streams: {len(self.current_formats)}"""
                             'Audio stream already complete from a previous'
                             ' attempt (size verified) - skipping download.\n',
                             'success')
-                        cached_audio_path = _agot
-                        audio_cached = True
                         audio_temp = _agot
+                        _a_salv = True
+                _v_need = not video_cached and not _v_salv
+                _a_need = not audio_cached and not _a_salv
+                # Protect anything we are about to read from eviction.
+                self._mark_cache_inuse(cached_video_path if video_cached else None,
+                                       cached_audio_path if audio_cached else None)
 
                 # ── Concurrent download when both streams need fetching ─────
                 # Video runs with terminal output (sets self._download_process).
                 # Audio runs silently in a daemon thread alongside it so both
                 # transfers happen in parallel, cutting total time roughly in half.
-                if not video_cached and not audio_cached:
+                if _v_need and _a_need:
                     # Build audio args now so the thread captures them correctly
                     audio_args_bg = [
                         '--no-warnings', '--newline', '--progress',
@@ -9597,6 +10629,9 @@ Total Streams: {len(self.current_formats)}"""
                         except Exception as exc:
                             self._audio_bg_process = None
                             _audio_exc[0] = exc
+                        finally:
+                            # cookie copies are reclaimed only by the process-guarded reap
+                            pass
 
                     self.append_terminal_output(
                         "Downloading video + audio streams concurrently...\n", 'info')
@@ -9631,7 +10666,7 @@ Total Streams: {len(self.current_formats)}"""
                         err = (_audio_result[0].stderr or "").strip()
                         raise Exception("Audio download failed: " + (err or "yt-dlp returned non-zero"))
 
-                elif not video_cached:
+                elif _v_need:
                     # Only video needs downloading
                     self.append_terminal_output("Downloading video stream (ID: " + str(video_format_id) + ")...\n", 'info')
                     video_args = [
@@ -9650,7 +10685,7 @@ Total Streams: {len(self.current_formats)}"""
                     video_args.append(url)
                     self.run_ytdlp_command_with_terminal(video_args, capture_output=False, timeout=7200)
 
-                elif not audio_cached:
+                elif _a_need:
                     # Only audio needs downloading
                     self.append_terminal_output("Downloading audio stream (ID: " + audio_format_id + ")...\n", 'info')
                     audio_args = [
@@ -9671,7 +10706,8 @@ Total Streams: {len(self.current_formats)}"""
                     self.run_ytdlp_command_with_terminal(audio_args, capture_output=False, timeout=7200)
 
                 # ── Resolve final file paths ────────────────────────────────
-                if not video_cached:
+                # (a salvaged leg is already resolved and size-verified)
+                if not video_cached and not _v_salv:
                     video_files = [f for f in os.listdir(temp_dir) if f.startswith(f"video_{video_format_id}")]
                     if not video_files:
                         raise Exception("Video download failed - file not found")
@@ -9679,7 +10715,7 @@ Total Streams: {len(self.current_formats)}"""
                     if not os.path.exists(video_temp) or os.path.getsize(video_temp) == 0:
                         raise Exception("Video file is missing or empty")
 
-                if not audio_cached:
+                if not audio_cached and not _a_salv:
                     audio_files = [f for f in os.listdir(temp_dir) if f.startswith("audio_" + audio_format_id)]
                     if not audio_files:
                         raise Exception("Audio download failed - file not found")
@@ -10389,6 +11425,7 @@ Total Streams: {len(self.current_formats)}"""
                     # Re-fetch failed or no matching stream - hard fail
                     error_msg = "Download failed (format expired, re-fetch unsuccessful): " + str(e)
                     self.append_terminal_output("\nFinal failure: " + error_msg + "\n\n", 'error')
+                    self._emit_dev_event('failed', error=error_msg)
                     try:
                         shutil.rmtree(temp_dir, ignore_errors=True)
                     except Exception:
@@ -10399,6 +11436,7 @@ Total Streams: {len(self.current_formats)}"""
                 if attempt == max_retries - 1:
                     error_msg = "Download and merge failed after " + str(max_retries) + " attempts: " + str(e)
                     self.append_terminal_output("\nFinal failure: " + error_msg + "\n\n", 'error')
+                    self._emit_dev_event('failed', error=error_msg)
                     try:
                         shutil.rmtree(temp_dir, ignore_errors=True)
                     except Exception:
@@ -11143,6 +12181,29 @@ Total Streams: {len(self.current_formats)}"""
         # worker thread before it scheduled this call.
         _hist_meta = getattr(self, '_pending_history_meta', None)
         self._pending_history_meta = None
+        self._clear_cache_inuse()
+        # A sustained run (playlist, deep queue) almost always has a yt-dlp
+        # alive, so the reap on copy-creation never fires and copies pile up.
+        # A finished download is the most likely idle moment there is; the
+        # process guard still decides whether anything is actually removed.
+        try:
+            threading.Thread(target=self._reap_cookie_copies,
+                             kwargs={'threshold': 40}, daemon=True).start()
+        except Exception:
+            pass
+        try:
+            _ev_info = (_hist_meta or {}).get('video_info') or {}
+            self._emit_dev_event(
+                'complete',
+                video_id=(_ev_info.get('id') if _ev_info else None),
+                title=(_ev_info.get('title') if _ev_info else None),
+                path=file_path,
+                operation=operation,
+                seconds=round(float(download_time or 0), 2),
+                size=(os.path.getsize(file_path)
+                      if file_path and os.path.exists(file_path) else 0))
+        except Exception:
+            pass
         try:
             _h_url  = (_hist_meta or {}).get('url', '') or self._currently_downloading_url or ''
             _h_info = (_hist_meta or {}).get('video_info') or {}
@@ -11432,14 +12493,19 @@ Total Streams: {len(self.current_formats)}"""
 
     @staticmethod
     def _parse_time_to_hhmmss(text):
-        """Convert a user-supplied time string to 'HH:MM:SS' or 'HH:MM:SS.s'
-        for yt-dlp --download-sections and FFmpeg -ss / -t flags.  Accepts:
-          '90'          -> '00:01:30'
-          '90.5'        -> '00:01:30.5'
-          '1:30'        -> '00:01:30'
-          '1:30.5'      -> '00:01:30.5'
-          '1:30:00'     -> '01:30:00'
-          '1:30:00.5'   -> '01:30:00.5'
+        """Convert a user-supplied time string to 'HH:MM:SS.ss'.
+
+        Output always carries hundredths so the precision is visible and
+        round-trips without silently losing it - yt-dlp
+        --download-sections and FFmpeg -ss / -to both accept fractional
+        seconds. Accepts:
+          '90'          -> '00:01:30.00'
+          '90.5'        -> '00:01:30.50'
+          '1:30'        -> '00:01:30.00'
+          '1:30.25'     -> '00:01:30.25'
+          '1:30:00'     -> '01:30:00.00'
+          '1:30:00.125' -> '01:30:00.12'   (ties round to even)
+          '0:01.15'     -> '00:00:01.15'
         Returns None if the string cannot be parsed.
         """
         text = (text or '').strip()
@@ -11467,12 +12533,16 @@ Total Streams: {len(self.current_formats)}"""
                 return None
             hh = str(h).zfill(2)
             mm = str(m).zfill(2)
-            s_int  = int(s)
-            s_frac = round(s - s_int, 1)
-            if s_frac > 0:
-                ss = '{:04.1f}'.format(s)
-            else:
-                ss = str(s_int).zfill(2)
+            ss = '{:05.2f}'.format(s)
+            # 59.999 rounds to '60.00' - carry it rather than emit a bad time
+            if ss.startswith('60'):
+                ss = '00.00'
+                m += 1
+                if m >= 60:
+                    m -= 60
+                    h += 1
+                hh = str(h).zfill(2)
+                mm = str(m).zfill(2)
             return hh + ':' + mm + ':' + ss
         except (ValueError, TypeError):
             return None
@@ -11685,6 +12755,13 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             _dur = 0
         _conv_to = max(600, min(int(_dur * 0.5), 7200)) if _dur else 900
 
+        # Output bitrate for any transcode, per the user's policy.
+        _src_abr = self._audio_source_abr(video_info, audio_format_id)
+        _tgt_abr = self._audio_output_bitrate(_src_abr)
+        _abr_arg = (str(_tgt_abr) + 'k') if _tgt_abr else '128k'
+        _mp3_q   = _abr_arg if _tgt_abr else '0'
+        _mp3_enc = ['-b:a', _abr_arg] if _tgt_abr else ['-q:a', '0']
+
         # ── Clip snapshot (Audio Only) ─────────────────────────────────────
         # Same validation as the video workers; the range is applied via
         # yt-dlp --download-sections so ONLY the slice is downloaded - a
@@ -11753,22 +12830,46 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
 
                 # ── Helper: codec detection via format ID lookup ──────────
                 def _is_aac_file(path, fmt_id=None):
-                    _fid = str(fmt_id) if fmt_id else ''
+                    """True when the file's audio really is AAC.
+
+                    Had two defects that cancelled out until the naming
+                    policy exposed them:
+                      * HLS-derived ids carry a suffix ('140-7', '249-20')
+                        and matched neither id set, so every one of them
+                        fell through to the probe below.
+                      * The probe searched the WHOLE of 'ffmpeg -i' output
+                        for 'opus'. Every full FFmpeg build advertises
+                        --enable-libopus in its banner, so that test was
+                        always true and the probe always answered False -
+                        even for a freshly transcoded AAC file.
+                    """
+                    # Ask the FILE first. The id argument is the RECOMMENDED
+                    # format, but the selector chain often downloads something
+                    # else - asking for AAC can legitimately land on 140-16
+                    # while the recommendation was 251-16. Trusting the id
+                    # then declared a genuine AAC file "Opus" and transcoded
+                    # it to AAC for nothing.
+                    if self.ffmpeg_path and os.path.exists(path):
+                        try:
+                            _p = subprocess.run(
+                                [self.ffmpeg_path, '-hide_banner', '-i', path],
+                                capture_output=True, text=True, encoding='utf-8',
+                                errors='replace', timeout=10,
+                                creationflags=CREATE_NO_WINDOW)
+                            _out = (_p.stdout or '') + (_p.stderr or '')
+                            for _line in _out.splitlines():
+                                if 'Audio:' in _line:
+                                    return 'aac' in _line.lower()
+                        except Exception:
+                            pass
+                    # No FFmpeg (or an unreadable file): fall back to the id,
+                    # stripping the HLS suffix so '140-16' matches '140'.
+                    _fid = str(fmt_id).split('-')[0] if fmt_id else ''
                     if _fid in _YT_AUDIO_AAC_IDS:
                         return True
                     if _fid in _YT_AUDIO_OPUS_IDS or _fid in _YT_AUDIO_VORBIS_IDS:
                         return False
-                    if not self.ffmpeg_path or not os.path.exists(path):
-                        return False
-                    try:
-                        _p = subprocess.run(
-                            [self.ffmpeg_path, '-i', path],
-                            capture_output=True, text=True, encoding='utf-8', errors='replace',
-                            timeout=10, creationflags=CREATE_NO_WINDOW)
-                        _out = (_p.stdout or '') + (_p.stderr or '')
-                        return 'aac' in _out.lower() and 'opus' not in _out.lower()
-                    except Exception:
-                        return False
+                    return False
 
                 # ── Helper: move temp file to final output path ───────────
                 def _move_to_output(tmp_path):
@@ -11779,7 +12880,19 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                     _ext  = os.path.splitext(tmp_path)[1].lower() or '.m4a'
                     # Build the final filename using the same assembly logic
                     # used by the merge worker so naming is consistent.
-                    _qt   = quality
+                    # Quality tag: for audio-only the video quality is
+                    # meaningless - 240p and 720p fetch the SAME audio
+                    # stream, so a [720p] tag implied a difference that did
+                    # not exist. Default is the real audio bitrate.
+                    _qtmode = getattr(self, 'audio_quality_tag', 'audio')
+                    if _qtmode == 'none':
+                        _qt = ''
+                    elif _qtmode == 'video':
+                        _qt = quality
+                    else:
+                        _abr0 = self._audio_source_abr(video_info, audio_format_id)
+                        _qt = ((str(_abr0) + 'kbps') if _abr0
+                               else (str(audio_format_id) if audio_format_id else ''))
                     _lang = ''
                     try:
                         for _af in (video_info.get('formats') or []):
@@ -11792,13 +12905,89 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                         pass
                     _bracket = (_qt + ' ' + _lang).strip()
                     _final_name = self._assemble_filename(video_info, _bracket, _ext)
-                    _final_path = self._unique_output_path(
-                        os.path.join(self.download_path, _final_name), _vid)
+                    # Optional separate destination for audio-only output.
+                    _outdir = getattr(self, 'audio_output_folder', '') or self.download_path
+                    try:
+                        os.makedirs(_outdir, exist_ok=True)
+                    except Exception:
+                        _outdir = self.download_path
+                    _target = os.path.join(_outdir, _final_name)
+                    _dup = getattr(self, 'audio_duplicate_action', 'number')
+                    if _dup == 'skip' and os.path.exists(_target):
+                        self.append_terminal_output(
+                            'File already exists - keeping the existing copy'
+                            ' (duplicate handling: skip).\n', 'warning')
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                        return _target
+                    if _dup == 'overwrite':
+                        _final_path = _target
+                        if os.path.exists(_final_path):
+                            try:
+                                os.remove(_final_path)
+                            except Exception:
+                                _final_path = self._unique_output_path(_target, _vid)
+                    else:
+                        _final_path = self._unique_output_path(_target, _vid)
                     shutil.move(tmp_path, _final_path)
                     return _final_path
 
+                def _apply_ext_policy(p, is_aac_content):
+                    """Decide the final container extension for M4A output.
+
+                    Native mode wrote every stream to 'audio.m4a' regardless
+                    of codec, so a low-bitrate Opus pick was delivered as an
+                    .m4a that iTunes/iOS and many car stereos refuse. Real
+                    AAC still gets .m4a; Opus follows the user's setting."""
+                    if is_aac_content:
+                        if not p.lower().endswith('.m4a'):
+                            _r = os.path.join(temp_dir, 'audio.m4a')
+                            os.replace(p, _r)
+                            return _r
+                        return p
+                    _mode = getattr(self, 'audio_opus_naming', 'codec')
+                    if _mode == 'm4a':
+                        if not p.lower().endswith('.m4a'):
+                            _r = os.path.join(temp_dir, 'audio.m4a')
+                            os.replace(p, _r)
+                            return _r
+                        return p
+                    if _mode == 'remux':
+                        _r = os.path.join(temp_dir, 'audio_remux.m4a')
+                        try:
+                            _rr = subprocess.run(
+                                [self.ffmpeg_path, '-y', '-i', p, '-c:a', 'copy',
+                                 '-strict', '-2', '-loglevel', 'error', _r],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding='utf-8', errors='replace',
+                                timeout=_conv_to, creationflags=CREATE_NO_WINDOW)
+                            if _rr.returncode == 0 and os.path.exists(_r):
+                                try:
+                                    os.remove(p)
+                                except Exception:
+                                    pass
+                                return _r
+                            self.append_terminal_output(
+                                'Remux to M4A failed - keeping the original'
+                                ' container.\n', 'warning')
+                        except Exception:
+                            pass
+                    # 'codec' (default), or remux failed: keep the true
+                    # extension yt-dlp produced so the file never lies.
+                    if p.lower().endswith('.m4a'):
+                        _true = os.path.join(temp_dir, 'audio.webm')
+                        try:
+                            os.replace(p, _true)
+                            return _true
+                        except Exception:
+                            return p
+                    return p
+
                 # temp_dir is created once before the retry loop (M5) so
                 # partials survive pause/resume and retry attempts.
+                _attempt_ok = False
                 try:
                     # ── Cache fast-path (attempt 0 only; full files, so
                     # bypassed in clip mode) ──────────────────────────────
@@ -11824,6 +13013,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                 self.append_terminal_output('Time: ' + self._format_download_time(download_time) + '\n\n', 'success')
                                 self.root.after(0, lambda p=actual_path, t=download_time:
                                     self._download_complete(p, 'Audio Download (cached)', t))
+                                _attempt_ok = True
                                 return
 
                             cached_src = None
@@ -11846,7 +13036,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                 else:
                                     conv_cmd = [
                                         self.ffmpeg_path, '-y', '-i', cached_src,
-                                        '-vn', '-acodec', 'libmp3lame', '-q:a', '0',
+                                        '-vn', '-acodec', 'libmp3lame'] + _mp3_enc + [
                                         '-loglevel', 'error', _tmp_mp3
                                     ]
                                     self.append_terminal_output(
@@ -11871,6 +13061,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                     self.append_terminal_output('Time: ' + self._format_download_time(download_time) + '\n\n', 'success')
                                     self.root.after(0, lambda p=actual_path, t=download_time:
                                         self._download_complete(p, 'Audio Download (cached)', t))
+                                    _attempt_ok = True
                                     return
                                 else:
                                     self.append_terminal_output(
@@ -11893,8 +13084,17 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                 is_aac = _is_aac_file(cached_src, audio_format_id)
 
                                 if use_native:
-                                    _tmp_m4a = os.path.join(temp_dir, 'audio.m4a')
+                                    # Name the staged copy after the cached
+                                    # file's real container, then let the
+                                    # policy decide - hardcoding .m4a here
+                                    # meant a CACHED Opus stream arrived as
+                                    # .m4a while a freshly downloaded one
+                                    # arrived as .webm.
+                                    self._mark_cache_inuse(cached_src)
+                                    _c_ext = os.path.splitext(cached_src)[1] or '.m4a'
+                                    _tmp_m4a = os.path.join(temp_dir, 'audio' + _c_ext)
                                     shutil.copy2(cached_src, _tmp_m4a)
+                                    _tmp_m4a = _apply_ext_policy(_tmp_m4a, is_aac)
                                     if is_aac:
                                         self.append_terminal_output(
                                             'Cached audio is native AAC - embedding metadata...\n', 'cache')
@@ -11915,6 +13115,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                     self.append_terminal_output('Time: ' + self._format_download_time(download_time) + '\n\n', 'success')
                                     self.root.after(0, lambda p=actual_path, t=download_time:
                                         self._download_complete(p, 'Audio Download (cached)', t))
+                                    _attempt_ok = True
                                     return
                                 else:
                                     # M4A AAC: transcode if needed
@@ -11929,7 +13130,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                             'No AAC stream available - converting from Opus...\n', 'info')
                                         conv_cmd = [
                                             self.ffmpeg_path, '-y', '-i', cached_src,
-                                            '-vn', '-acodec', 'aac', '-b:a', '128k',
+                                            '-vn', '-acodec', 'aac', '-b:a', _abr_arg,
                                             '-loglevel', 'error', _tmp_m4a
                                         ]
                                         conv_result = subprocess.run(
@@ -11951,6 +13152,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                         self.append_terminal_output('Time: ' + self._format_download_time(download_time) + '\n\n', 'success')
                                         self.root.after(0, lambda p=actual_path, t=download_time:
                                             self._download_complete(p, 'Audio Download (cached)', t))
+                                        _attempt_ok = True
                                         return
                                     else:
                                         self.append_terminal_output(
@@ -11985,7 +13187,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                         args = _common_args + [
                             '-f', _mp3_sel,
                             '--extract-audio', '--audio-format', 'mp3',
-                            '--audio-quality', '0',
+                            '--audio-quality', _mp3_q,
                             '-o', _tmp_out,
                         ]
                         args.extend(self.get_player_client_extractor_args())
@@ -12028,7 +13230,11 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
 
                     elif use_native:
                         _fmt_sel  = audio_format_id if audio_format_id else 'bestaudio'
-                        _tmp_out  = os.path.join(temp_dir, 'audio.m4a')
+                        if getattr(self, 'audio_opus_naming', 'codec') == 'prefer_aac':
+                            # Ask for a real AAC stream first; fall back to
+                            # the recommended pick when the video has none.
+                            _fmt_sel = 'bestaudio[acodec^=mp4a]/' + _fmt_sel
+                        _tmp_out  = os.path.join(temp_dir, 'audio.%(ext)s')
                         args = _common_args + ['-f', _fmt_sel, '-o', _tmp_out]
                         args.extend(self.get_player_client_extractor_args())
                         args.extend(self.get_ytdlp_dns_args())
@@ -12058,11 +13264,13 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                         if not _tmp_audio or not os.path.exists(_tmp_audio):
                             raise Exception('Audio file not found in temp dir after download')
 
-                        # Ensure .m4a extension
-                        if not _tmp_audio.lower().endswith('.m4a'):
-                            _renamed = os.path.join(temp_dir, 'audio.m4a')
-                            os.replace(_tmp_audio, _renamed)
-                            _tmp_audio = _renamed
+                        # Cache the RAW stream (before renaming/embedding) so
+                        # repeat downloads and later merges reuse it.
+                        if not _clip_active:
+                            self._cache_raw_audio_stream(_vid, audio_format_id, _tmp_audio)
+
+                        _tmp_audio = _apply_ext_policy(
+                            _tmp_audio, _is_aac_file(_tmp_audio, audio_format_id))
 
                         if _is_aac_file(_tmp_audio, audio_format_id):
                             _embed_result = self._embed_metadata(_tmp_audio, video_info)
@@ -12088,8 +13296,17 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                         # before ever reaching bare bestaudio - previously a
                         # no-AAC video grabbed the largest Opus regardless.
                         _fid_fb   = (str(audio_format_id) + '/') if audio_format_id else ''
-                        _fmt_sel  = (_aac_sel + '/bestaudio[acodec=aac]/'
-                                     + _fid_fb + 'bestaudio')
+                        # 'acodec=aac' matches nothing: YouTube reports its
+                        # AAC streams as mp4a.40.2, so the filter always
+                        # failed and the chain fell through to the plain
+                        # recommended id - an Opus stream - which then got
+                        # transcoded for no reason. Bare ids like '140' also
+                        # miss the HLS-derived '140-16' variants, so match on
+                        # codec and container instead of on id alone.
+                        _fmt_sel  = (_aac_sel
+                                     + '/bestaudio[acodec^=mp4a]'
+                                     + '/bestaudio[ext=m4a]'
+                                     + '/' + _fid_fb + 'bestaudio')
                         _tmp_out  = os.path.join(temp_dir, 'audio.m4a')
                         args = _common_args + ['-f', _fmt_sel, '-o', _tmp_out]
                         args.extend(self.get_player_client_extractor_args())
@@ -12119,13 +13336,30 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                         if not _tmp_audio or not os.path.exists(_tmp_audio):
                             raise Exception('Audio file not found in temp dir after download')
 
-                        if not _is_aac_file(_tmp_audio, audio_format_id):
+                        # Cache the RAW stream only when it is genuine AAC: a
+                        # transcode must never be stored under the source
+                        # format id.
+                        if not _clip_active and _is_aac_file(_tmp_audio, audio_format_id):
+                            self._cache_raw_audio_stream(_vid, audio_format_id, _tmp_audio)
+
+                        _did_convert = False
+                        _no_aac = (not _is_aac_file(_tmp_audio, audio_format_id))
+                        _na_act = getattr(self, 'audio_no_aac_action', 'transcode')
+                        if _no_aac and _na_act == 'skip':
+                            raise Exception(
+                                'No AAC stream available for this video and'
+                                ' the no-AAC setting is "skip".')
+                        if _no_aac and _na_act == 'keep_opus':
+                            self.append_terminal_output(
+                                'No AAC stream available - keeping the original'
+                                ' Opus stream without transcoding.\n', 'warning')
+                        if _no_aac and _na_act == 'transcode':
                             self.append_terminal_output(
                                 'No AAC stream available - converting from Opus...\n', 'info')
                             _conv_out = os.path.join(temp_dir, 'audio_aac.m4a')
                             conv_cmd = [
                                 self.ffmpeg_path, '-y', '-i', _tmp_audio,
-                                '-vn', '-acodec', 'aac', '-b:a', '128k',
+                                '-vn', '-acodec', 'aac', '-b:a', _abr_arg,
                                 '-loglevel', 'error', _conv_out
                             ]
                             conv_result = subprocess.run(
@@ -12138,6 +13372,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                 except Exception:
                                     pass
                                 _tmp_audio = _conv_out
+                                _did_convert = True
                             else:
                                 # M6 fix: never rename an unconverted Opus file
                                 # to .m4a as if it were AAC - that delivers a
@@ -12148,13 +13383,12 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                     + str(conv_result.returncode) + '): '
                                     + (_cv_err or 'no ffmpeg output'))
 
-                        if not _tmp_audio.lower().endswith('.m4a'):
-                            _renamed = os.path.join(temp_dir, 'audio.m4a')
-                            try:
-                                os.replace(_tmp_audio, _renamed)
-                                _tmp_audio = _renamed
-                            except Exception:
-                                pass
+                        # A completed transcode is AAC in an M4A container by
+                        # construction - asking _is_aac_file about it with the
+                        # SOURCE format id is both wrong and fragile.
+                        _tmp_audio = _apply_ext_policy(
+                            _tmp_audio,
+                            _did_convert or _is_aac_file(_tmp_audio, audio_format_id))
 
                         _embed_result = self._embed_metadata(_tmp_audio, video_info)
                         _tmp_audio = _embed_result if _embed_result else _tmp_audio
@@ -12169,16 +13403,20 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                     self.append_terminal_output('Time: ' + self._format_download_time(download_time) + '\n\n', 'success')
                     self.root.after(0, lambda p=actual_path, t=download_time:
                         self._download_complete(p, 'Audio Download', t))
+                    _attempt_ok = True
                     return
 
                 finally:
-                    # M5 fix: only clean up when this attempt is returning
-                    # normally (success - the audio file was already moved
-                    # out). On pause/stop/retryable failure the partial is
-                    # kept so -c can resume it; final-failure and fid-restart
-                    # clean up explicitly below. Orphans from a hard kill are
-                    # swept by _cleanup_ysa_temp_dirs at exit.
-                    if sys.exc_info()[0] is None:
+                    # Clean up only on a successful attempt (the audio file
+                    # has already been moved out). On pause/stop/retryable
+                    # failure the partial is kept so -c can resume it.
+                    # An explicit flag is used rather than sys.exc_info():
+                    # that reports any exception being handled ANYWHERE up
+                    # the stack, so the format-refresh restart - which calls
+                    # this worker from inside an except block - made every
+                    # nested success look like a failure and leaked its
+                    # temp dir.
+                    if _attempt_ok:
                         shutil.rmtree(temp_dir, ignore_errors=True)
 
             except (_DownloadStoppedError, _DownloadPausedError):
@@ -12215,9 +13453,23 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                     os.remove(os.path.join(temp_dir, _pf))
                             except Exception:
                                 pass
-                            self._download_audio_only_worker(
-                                output_path, quality, url, fresh_info,
-                                fresh_fid, video_id, temp_dir)
+                            # Depth guard: a format that keeps "expiring" would
+                            # otherwise restart the worker from inside its own
+                            # except handler without limit.
+                            _d = getattr(self, '_fmt_restart_depth', 0)
+                            if _d >= 2:
+                                self.append_terminal_output(
+                                    'Format kept expiring after ' + str(_d)
+                                    + ' refreshes - giving up on this attempt.\n',
+                                    'error')
+                                raise
+                            self._fmt_restart_depth = _d + 1
+                            try:
+                                self._download_audio_only_worker(
+                                    output_path, quality, url, fresh_info,
+                                    fresh_fid, video_id, temp_dir)
+                            finally:
+                                self._fmt_restart_depth = _d
                             return
                         else:
                             self.append_terminal_output(
@@ -12564,6 +13816,20 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                  '      <div id="hs" class="dhandle"></div>\n'
                  '      <div id="he" class="dhandle"></div>\n'
                  '    </div>\n'
+                 '    <div style="margin-bottom:8px;font-size:12px">\n'
+                 '      <label style="opacity:.8">Start</label>\n'
+                 '      <input id="cs" type="text" value="00:00:00.00" spellcheck="false"\n'
+                 '        style="width:96px;text-align:center;font-family:Consolas,monospace;padding:2px 4px">\n'
+                 '      <button onclick="setFromPlayhead(&quot;S&quot;)" title="Use the current playback position"\n'
+                 '        style="font-size:11px;padding:3px 7px">&#9673;</button>\n'
+                 '      <label style="margin-left:12px;opacity:.8">End</label>\n'
+                 '      <input id="ce" type="text" value="00:00:00.00" spellcheck="false"\n'
+                 '        style="width:96px;text-align:center;font-family:Consolas,monospace;padding:2px 4px">\n'
+                 '      <button onclick="setFromPlayhead(&quot;E&quot;)" title="Use the current playback position"\n'
+                 '        style="font-size:11px;padding:3px 7px">&#9673;</button>\n'
+                 '      <button onclick="applyBoxes()" style="font-size:11px;padding:3px 9px;margin-left:8px">Apply</button>\n'
+                 '      <span style="margin-left:8px;opacity:.55;font-size:11px">HH:MM:SS.ss &#183; Enter applies &#183; &#8593;&#8595; 0.1s, Shift 1s, Ctrl 0.01s</span>\n'
+                 '    </div>\n'
                  '    <div style="margin-bottom:8px">\n'
                  '      <button onclick="resetClip()" style="font-size:11px;padding:3px 9px">&#8635; Reset clip range</button>\n'
                  '    </div>\n'
@@ -12600,10 +13866,11 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                  '\n'
                  'function fmt(s){\n'
                  '  s=Math.max(0,s);\n'
-                 '  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=(s%60).toFixed(1);\n'
-                 '  const p=(n,d)=>String(n).padStart(d,"0");\n'
-                 '  return h>0?p(h,2)+":"+p(m,2)+":"+p(parseFloat(sc).toFixed(1),4)\n'
-                 '            :p(m,2)+":"+p(parseFloat(sc).toFixed(1),4);\n'
+                 '  var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60;\n'
+                 '  var ss=sc.toFixed(2); if(sc<10) ss="0"+ss;\n'
+                 '  if(ss.indexOf("60")===0){ss="00.00"; m+=1; if(m>=60){m-=60;h+=1;}}\n'
+                 '  var p=function(n,d){return String(n).padStart(d,"0");};\n'
+                 '  return h>0?p(h,2)+":"+p(m,2)+":"+ss:p(m,2)+":"+ss;\n'
                  '}\n'
                  'function clamp01(x){return Math.max(0,Math.min(1,x));}\n'
                  '\n'
@@ -12632,7 +13899,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                  '  hs.style.left=(pS*w)+"px"; he.style.left=(pE*w)+"px";\n'
                  '  df.style.left=(lo*100)+"%"; df.style.width=((hi-lo)*100)+"%";\n'
                  '  const s=lo*dur,e=hi*dur;\n'
-                 '  ci.textContent=" "+fmt(s)+" \\u2192 "+fmt(e)+"  ("+Math.max(0,e-s).toFixed(1)+"s)";\n'
+                 '  ci.textContent=" "+_hms(s)+" \\u2192 "+_hms(e)+"  ("+Math.max(0,e-s).toFixed(2)+"s)";\n'
                  '}\n'
                  'let dragging=null;\n'
                  'function startDrag(h,e){dragging=h;e.preventDefault();}\n'
@@ -12697,6 +13964,49 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                  'function resetClip(){pS=0;pE=1;updateHandles();fetch("/update?start=0&end="+dur);}\n'
                  'function sendClip(){fetch("/update?start="+Math.min(pS,pE)*dur+"&end="+Math.max(pS,pE)*dur);}\n'
                  '\n'
+                 'function _hms(t){t=Math.max(0,t||0);\n'
+                 '  var h=Math.floor(t/3600),m=Math.floor((t%3600)/60),s=t%60;\n'
+                 '  var ss=s.toFixed(2); if(s<10) ss="0"+ss;\n'
+                 '  if(ss.indexOf("60")===0){ss="00.00"; m+=1; if(m>=60){m-=60;h+=1;}}\n'
+                 '  return (h<10?"0":"")+h+":"+(m<10?"0":"")+m+":"+ss;}\n'
+                 'function _parseHMS(x){var p=String(x||"").trim().split(":"),v;\n'
+                 '  if(p.length===3){v=(+p[0])*3600+(+p[1])*60+parseFloat(p[2]);}\n'
+                 '  else if(p.length===2){v=(+p[0])*60+parseFloat(p[1]);}\n'
+                 '  else {v=parseFloat(p[0]);}\n'
+                 '  return isNaN(v)?null:v;}\n'
+                 'function syncBoxes(){var a=document.getElementById("cs"),b=document.getElementById("ce");\n'
+                 '  if(!a||!b)return;\n'
+                 '  if(document.activeElement!==a) a.value=_hms(Math.min(pS,pE)*dur);\n'
+                 '  if(document.activeElement!==b) b.value=_hms(Math.max(pS,pE)*dur);}\n'
+                 'function applyBoxes(){\n'
+                 '  var s=_parseHMS(document.getElementById("cs").value);\n'
+                 '  var e=_parseHMS(document.getElementById("ce").value);\n'
+                 '  if(s===null||e===null){syncBoxes();return;}\n'
+                 '  s=Math.max(0,Math.min(s,dur)); e=Math.max(0,Math.min(e,dur));\n'
+                 '  if(e<=s) e=Math.min(dur,s+0.05);\n'
+                 '  pS=s/dur; pE=e/dur; updateHandles();\n'
+                 '  if(v.currentTime<s||v.currentTime>=e) v.currentTime=s;\n'
+                 '  fetch("/update?start="+s+"&end="+e);}\n'
+                 'function setFromPlayhead(w){\n'
+                 '  var t=v.currentTime;\n'
+                 '  if(w==="S"){document.getElementById("cs").value=_hms(t);}\n'
+                 '  else {document.getElementById("ce").value=_hms(t);}\n'
+                 '  applyBoxes();}\n'
+                 'var _origUH=updateHandles;\n'
+                 'updateHandles=function(){_origUH.apply(this,arguments); syncBoxes();};\n'
+                 '["cs","ce"].forEach(function(id){\n'
+                 '  var el=document.getElementById(id); if(!el)return;\n'
+                 '  el.addEventListener("keydown",function(ev){\n'
+                 '    if(ev.key==="Enter"){ev.preventDefault();applyBoxes();el.blur();}\n'
+                 '    else if(ev.key==="ArrowUp"||ev.key==="ArrowDown"){\n'
+                 '      ev.preventDefault();\n'
+                 '      var t=_parseHMS(el.value); if(t===null)return;\n'
+                 '      var step=ev.ctrlKey?0.01:(ev.shiftKey?1:0.1);\n'
+                 '      el.value=_hms(t+(ev.key==="ArrowUp"?step:-step)); applyBoxes();}\n'
+                 '  });\n'
+                 '  el.addEventListener("blur",applyBoxes);\n'
+                 '  el.addEventListener("focus",function(){el.select();});\n'
+                 '});\n'
                  'updateHandles(); updateSeekThumb(0);\n'
                  'window.addEventListener("resize",function(){updateHandles();updateSeekThumb(v.currentTime/dur);});\n'
                  '</script>\n</body>\n</html>')
@@ -12736,7 +14046,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                         def _sec_fmt(sec):
                             sec=max(0.0,float(sec)); h=int(sec//3600)
                             m=int((sec%3600)//60); s=sec%60
-                            return str(h).zfill(2)+':'+str(m).zfill(2)+':'+'{:04.1f}'.format(s)
+                            return str(h).zfill(2)+':'+str(m).zfill(2)+':'+'{:05.2f}'.format(s)
                         def _apply():
                             _app_ref._clip_start_var.set(_sec_fmt(_s))
                             _app_ref._clip_end_var.set(_sec_fmt(_e))
@@ -12995,10 +14305,20 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         else:
             self.append_terminal_output("-" * 50 + "\n", "info")
 
+    def _dns_warmup_notify(self):
+        """Background DNS warm-up for the Settings toggle (see _on_dns_toggle)."""
+        if not _dns_probe_and_warm():
+            self.root.after(0, lambda: self.append_terminal_output(
+                "WARNING: Google DNS (8.8.8.8) did not respond - downloads may"
+                " stall. Turn Custom DNS off in Settings if this persists.\n",
+                "warning"))
+
     def _on_dns_toggle(self):
         """Enable or disable custom DNS when checkbox toggled."""
         if self.custom_dns_enabled.get():
-            dns_ok = enable_custom_dns()
+            enable_custom_dns(probe=False)
+            dns_ok = True
+            threading.Thread(target=self._dns_warmup_notify, daemon=True).start()
             if dns_ok:
                 self.append_terminal_output(
                     "Custom DNS ENABLED - local proxy on port " + str(_proxy_port or 0) +
@@ -13052,71 +14372,209 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
 
     # ── Config persistence ─────────────────────────────────────────────────
 
+    def _apply_saved_geometry(self, default_geom):
+        """Restore the window size/position saved at the last clean exit.
+
+        Guarded: a saved position from a monitor that is no longer attached
+        (or a resolution change) can put the window somewhere unreachable,
+        so anything that would land off-screen falls back to the default
+        rather than leaving a window that cannot be dragged into view."""
+        geom = getattr(self, 'window_geometry', '') or ''
+        if not getattr(self, 'remember_window', True) or not geom:
+            self.root.geometry(default_geom)
+            return
+        try:
+            _m = re.match(r'^(\d+)x(\d+)([+-]\d+)([+-]\d+)$', geom.strip())
+            if not _m:
+                self.root.geometry(default_geom)
+                return
+            w, h = int(_m.group(1)), int(_m.group(2))
+            x, y = int(_m.group(3)), int(_m.group(4))
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            # winfo_screenwidth is the PRIMARY monitor only, so a window on a
+            # second screen looked "off-screen" and got re-centred every time.
+            # The virtual root covers the whole desktop, including monitors
+            # left of or above the primary one (negative origin).
+            try:
+                vx, vy = self.root.winfo_vrootx(), self.root.winfo_vrooty()
+                vw = max(sw, self.root.winfo_vrootwidth())
+                vh = max(sh, self.root.winfo_vrootheight())
+            except Exception:
+                vx, vy, vw, vh = 0, 0, sw, sh
+            w = max(700, min(w, vw))
+            h = max(500, min(h, vh))
+            # Negative coordinates cannot be restored: Tk reads a leading '-'
+            # in a geometry string as "distance from the RIGHT/BOTTOM edge",
+            # not as a negative position, so a window on a monitor left of or
+            # above the primary one would be placed somewhere else entirely.
+            # Those re-centre; monitors to the right/below use plain positive
+            # coordinates and restore exactly.
+            if (x < 0 or y < 0
+                    or x > vx + vw - 120 or y > vy + vh - 80):
+                x = max(0, (vw - w) // 2 if vx >= 0 else (sw - w) // 2)
+                y = max(0, (vh - h) // 3 if vy >= 0 else (sh - h) // 3)
+            _geom = str(w) + 'x' + str(h) + '+' + str(x) + '+' + str(y)
+            self.root.geometry(_geom)
+
+            # Windows usually ignores a POSITION set before the window is
+            # mapped - the size sticks but the WM places the window itself,
+            # which is why size persisted and position never did. Re-apply
+            # once the event loop is running and the window really exists.
+            def _reapply_geom():
+                try:
+                    if (self.root.winfo_exists()
+                            and not getattr(self, 'window_maximized', False)):
+                        self.root.geometry(_geom)
+                except Exception:
+                    pass
+            try:
+                self.root.after(120, _reapply_geom)
+            except Exception:
+                pass
+
+            if getattr(self, 'window_maximized', False):
+                try:
+                    self.root.after(150, lambda: self.root.state('zoomed'))
+                except Exception:
+                    pass
+        except Exception:
+            self.root.geometry(default_geom)
+
+    def _capture_window_geometry(self):
+        """Remember the window box. Maximized state is stored separately -
+        a zoomed window reports a geometry string that restores badly."""
+        try:
+            if not getattr(self, 'remember_window', True):
+                return
+            _zoomed = False
+            try:
+                _zoomed = (self.root.state() == 'zoomed')
+            except Exception:
+                pass
+            self.window_maximized = _zoomed
+            if not _zoomed:
+                self.root.update_idletasks()
+                self.window_geometry = self.root.geometry()
+        except Exception:
+            pass
+
+    def _reset_window_geometry(self):
+        self.window_geometry = ''
+        self.window_maximized = False
+        try:
+            self.root.state('normal')
+        except Exception:
+            pass
+        self.root.geometry("1000x1100")
+        self._save_config_now()
+        messagebox.showinfo("Window", "Window size and position reset.")
+
+    def _cfg_get(self, cfg, key, current, cast=None):
+        """Read ONE config key defensively; never let it poison the rest.
+
+        The loader used to be a single try block: one bad value (a string
+        where an int was expected, a hand-edit typo, a half-written file)
+        raised, and every setting AFTER that line silently reverted to its
+        default. With the settings count growing, that failure mode gets
+        worse, so each key now stands alone - a bad one keeps its previous
+        value and is reported, and its neighbours are untouched."""
+        if key not in cfg:
+            return current
+        try:
+            val = cfg[key]
+            if cast is not None:
+                val = cast(val)
+            return val
+        except Exception:
+            try:
+                self._cfg_bad_keys.append(key)
+            except Exception:
+                pass
+            return current
+
     def _load_config(self):
         """Load persistent configuration from ysa_config.json."""
-        config_file = os.path.join(SCRIPT_DIR, 'ysa_config.json')
+        self._cfg_bad_keys = []
+        config_file = os.path.join(SCRIPT_DIR, getattr(self, 'config_filename', 'ysa_config.json'))
         if not os.path.exists(config_file):
             return
         try:
             with open(config_file, 'r') as f:
                 cfg = json.load(f)
-            self.download_path = cfg.get('download_path', self.download_path)
-            self.default_quality = cfg.get('default_quality', self.default_quality)
-            self.dark_mode = cfg.get('dark_mode', self.dark_mode)
-            self.persistent_cache = cfg.get('persistent_cache', self.persistent_cache)
-            self.max_cache_mb = int(cfg.get('max_cache_mb', self.max_cache_mb))
-            self.preferred_language = cfg.get('preferred_language', self.preferred_language)
-            self.auto_update_tools = bool(cfg.get('auto_update_tools', self.auto_update_tools))
-            self.size_limit_enabled = bool(cfg.get('size_limit_enabled', self.size_limit_enabled))
-            self.size_limit_mb = int(cfg.get('size_limit_mb', self.size_limit_mb))
-            self.size_limit_fallback = cfg.get('size_limit_fallback', self.size_limit_fallback)
-            self.size_upgrade_enabled = bool(cfg.get('size_upgrade_enabled', self.size_upgrade_enabled))
-            self.size_upgrade_to = cfg.get('size_upgrade_to', self.size_upgrade_to)
-            self.player_client = cfg.get('player_client', self.player_client)
-            self.prewarm_enabled = bool(cfg.get('prewarm_enabled', self.prewarm_enabled))
-            self.parallel_hardsub = bool(cfg.get('parallel_hardsub', self.parallel_hardsub))
-            self.advance_queue_on_streams_done = bool(cfg.get('advance_queue_on_streams_done', self.advance_queue_on_streams_done))
-            self.precache_concurrent_count = max(1, int(cfg.get('precache_concurrent_count', self.precache_concurrent_count)))
-            self.batch_concurrent_fetches = max(1, min(8, int(cfg.get('batch_concurrent_fetches', getattr(self, 'batch_concurrent_fetches', 3)))))
-            self.clipboard_watch = bool(cfg.get('clipboard_watch', self.clipboard_watch))
-            self.batch_start_immediately = bool(cfg.get('batch_start_immediately', self.batch_start_immediately))
-            self.terminal_expanded = bool(cfg.get('terminal_expanded', self.terminal_expanded))
-            self.custom_dns = bool(cfg.get('custom_dns', self.custom_dns))
-            self.filename_include_date = bool(cfg.get('filename_include_date', self.filename_include_date))
-            self.filename_format = str(cfg.get('filename_format', self.filename_format))
-            self.cookies_browser = str(cfg.get('cookies_browser', self.cookies_browser))
-            self.cookies_file = str(cfg.get('cookies_file', self.cookies_file))
+            self.download_path = self._cfg_get(cfg, 'download_path', self.download_path)
+            self.default_quality = self._cfg_get(cfg, 'default_quality', self.default_quality)
+            self.dark_mode = self._cfg_get(cfg, 'dark_mode', self.dark_mode)
+            self.persistent_cache = self._cfg_get(cfg, 'persistent_cache', self.persistent_cache)
+            self.max_cache_mb = self._cfg_get(cfg, 'max_cache_mb', self.max_cache_mb, int)
+            self.preferred_language = self._cfg_get(cfg, 'preferred_language', self.preferred_language)
+            self.auto_update_tools = self._cfg_get(cfg, 'auto_update_tools', self.auto_update_tools, bool)
+            self.size_limit_enabled = self._cfg_get(cfg, 'size_limit_enabled', self.size_limit_enabled, bool)
+            self.size_limit_mb = self._cfg_get(cfg, 'size_limit_mb', self.size_limit_mb, int)
+            self.size_limit_fallback = self._cfg_get(cfg, 'size_limit_fallback', self.size_limit_fallback)
+            self.size_upgrade_enabled = self._cfg_get(cfg, 'size_upgrade_enabled', self.size_upgrade_enabled, bool)
+            self.size_upgrade_to = self._cfg_get(cfg, 'size_upgrade_to', self.size_upgrade_to)
+            self.player_client = self._cfg_get(cfg, 'player_client', self.player_client)
+            self.prewarm_enabled = self._cfg_get(cfg, 'prewarm_enabled', self.prewarm_enabled, bool)
+            self.parallel_hardsub = self._cfg_get(cfg, 'parallel_hardsub', self.parallel_hardsub, bool)
+            self.advance_queue_on_streams_done = self._cfg_get(cfg, 'advance_queue_on_streams_done', self.advance_queue_on_streams_done, bool)
+            self.precache_concurrent_count = self._cfg_get(cfg, 'precache_concurrent_count', self.precache_concurrent_count, lambda v: max(1, int(v)))
+            self.batch_concurrent_fetches = self._cfg_get(cfg, 'batch_concurrent_fetches', getattr(self, 'batch_concurrent_fetches', 3), lambda v: max(1, min(8, int(v))))
+            self.clipboard_watch = self._cfg_get(cfg, 'clipboard_watch', self.clipboard_watch, bool)
+            self.batch_start_immediately = self._cfg_get(cfg, 'batch_start_immediately', self.batch_start_immediately, bool)
+            self.terminal_expanded = self._cfg_get(cfg, 'terminal_expanded', self.terminal_expanded, bool)
+            self.custom_dns = self._cfg_get(cfg, 'custom_dns', self.custom_dns, bool)
+            self.filename_include_date = self._cfg_get(cfg, 'filename_include_date', self.filename_include_date, bool)
+            self.filename_format = self._cfg_get(cfg, 'filename_format', self.filename_format, str)
+            self.cookies_browser = self._cfg_get(cfg, 'cookies_browser', self.cookies_browser, str)
+            self.cookies_file = self._cfg_get(cfg, 'cookies_file', self.cookies_file, str)
             # Resolve relative cookie paths against SCRIPT_DIR so they survive
             # working-directory changes (e.g. from file-browse dialogs on Windows).
             if self.cookies_file and not os.path.isabs(self.cookies_file):
                 self.cookies_file = os.path.join(SCRIPT_DIR, self.cookies_file)
-            self.cookies_enabled = bool(cfg.get('cookies_enabled', getattr(self, 'cookies_enabled', True)))
-            self.bgutil_server_url = str(cfg.get('bgutil_server_url', self.bgutil_server_url))
-            self.bgutil_server_path = str(cfg.get('bgutil_server_path', self.bgutil_server_path))
-            self.bgutil_autostart = bool(cfg.get('bgutil_autostart', self.bgutil_autostart))
-            self.bgutil_keep_running = bool(cfg.get('bgutil_keep_running', getattr(self, 'bgutil_keep_running', True)))
-            self.extended_client_cascade = bool(cfg.get('extended_client_cascade', self.extended_client_cascade))
-            self.meta_embed_title = bool(cfg.get('meta_embed_title', self.meta_embed_title))
-            self.meta_embed_artist = bool(cfg.get('meta_embed_artist', self.meta_embed_artist))
-            self.meta_embed_date = bool(cfg.get('meta_embed_date', self.meta_embed_date))
-            self.meta_embed_comment = bool(cfg.get('meta_embed_comment', self.meta_embed_comment))
-            self.meta_embed_synopsis = bool(cfg.get('meta_embed_synopsis', self.meta_embed_synopsis))
-            self.embed_metadata = bool(cfg.get('embed_metadata', self.embed_metadata))
+            self.cookies_enabled = self._cfg_get(cfg, 'cookies_enabled', getattr(self, 'cookies_enabled', True), bool)
+            self.bgutil_server_url = self._cfg_get(cfg, 'bgutil_server_url', self.bgutil_server_url, str)
+            self.bgutil_server_path = self._cfg_get(cfg, 'bgutil_server_path', self.bgutil_server_path, str)
+            self.bgutil_autostart = self._cfg_get(cfg, 'bgutil_autostart', self.bgutil_autostart, bool)
+            self.bgutil_keep_running = self._cfg_get(cfg, 'bgutil_keep_running', getattr(self, 'bgutil_keep_running', True), bool)
+            self.extended_client_cascade = self._cfg_get(cfg, 'extended_client_cascade', self.extended_client_cascade, bool)
+            self.meta_embed_title = self._cfg_get(cfg, 'meta_embed_title', self.meta_embed_title, bool)
+            self.meta_embed_artist = self._cfg_get(cfg, 'meta_embed_artist', self.meta_embed_artist, bool)
+            self.meta_embed_date = self._cfg_get(cfg, 'meta_embed_date', self.meta_embed_date, bool)
+            self.meta_embed_comment = self._cfg_get(cfg, 'meta_embed_comment', self.meta_embed_comment, bool)
+            self.meta_embed_synopsis = self._cfg_get(cfg, 'meta_embed_synopsis', self.meta_embed_synopsis, bool)
+            self.embed_metadata = self._cfg_get(cfg, 'embed_metadata', self.embed_metadata, bool)
             # Legacy migration: embed_subtitles bool -> subtitle_source
-            _legacy_embed = cfg.get('embed_subtitles', None)
-            self.subtitle_source = cfg.get('subtitle_source',
-                ('manual' if _legacy_embed else 'off') if _legacy_embed is not None
-                else self.subtitle_source)
+            try:
+                _legacy_embed = cfg.get('embed_subtitles', None)
+                self.subtitle_source = cfg.get('subtitle_source',
+                    ('manual' if _legacy_embed else 'off') if _legacy_embed is not None
+                    else self.subtitle_source)
+            except Exception:
+                self._cfg_bad_keys.append('subtitle_source')
             # subtitle_last_source remembers the combo selection even when toggle is off.
             # Migration: if no saved value, derive from subtitle_source (if it's not 'off').
             _default_last_src = self.subtitle_source if self.subtitle_source != 'off' else self.subtitle_last_source
-            self.subtitle_last_source = cfg.get('subtitle_last_source', _default_last_src)
-            self.subtitle_mode = cfg.get('subtitle_mode', self.subtitle_mode)
-            self.subtitle_lang = cfg.get('subtitle_lang', self.subtitle_lang)
-            self.preferred_audio_bitrate = int(cfg.get('preferred_audio_bitrate', self.preferred_audio_bitrate))
-            self.preferred_video_bitrate = int(cfg.get('preferred_video_bitrate', self.preferred_video_bitrate))
-            self.audio_only_mode_default = bool(cfg.get('audio_only_mode', self.audio_only_mode_default))
-            self.audio_only_format = cfg.get('audio_only_format', getattr(self, 'audio_only_format', 'm4a_native'))
+            self.subtitle_last_source = self._cfg_get(cfg, 'subtitle_last_source', _default_last_src)
+            self.subtitle_mode = self._cfg_get(cfg, 'subtitle_mode', self.subtitle_mode)
+            self.subtitle_lang = self._cfg_get(cfg, 'subtitle_lang', self.subtitle_lang)
+            self.preferred_audio_bitrate = self._cfg_get(cfg, 'preferred_audio_bitrate', self.preferred_audio_bitrate, int)
+            self.preferred_video_bitrate = self._cfg_get(cfg, 'preferred_video_bitrate', self.preferred_video_bitrate, int)
+            self.audio_only_mode_default = self._cfg_get(cfg, 'audio_only_mode', self.audio_only_mode_default, bool)
+            self.audio_only_format = self._cfg_get(cfg, 'audio_only_format', getattr(self, 'audio_only_format', 'm4a_native'))
+            self.audio_opus_naming = self._cfg_get(cfg, 'audio_opus_naming', self.audio_opus_naming, str)
+            self.audio_bitrate_policy = self._cfg_get(cfg, 'audio_bitrate_policy', self.audio_bitrate_policy, str)
+            self.audio_fixed_bitrate = self._cfg_get(cfg, 'audio_fixed_bitrate', self.audio_fixed_bitrate, lambda v: max(32, min(320, int(v))))
+            self.audio_drc_pref = self._cfg_get(cfg, 'audio_drc_pref', self.audio_drc_pref, str)
+            self.audio_quality_tag = self._cfg_get(cfg, 'audio_quality_tag', self.audio_quality_tag, str)
+            self.audio_no_aac_action = self._cfg_get(cfg, 'audio_no_aac_action', self.audio_no_aac_action, str)
+            self.audio_cache_streams = self._cfg_get(cfg, 'audio_cache_streams', self.audio_cache_streams, bool)
+            self.audio_output_folder = self._cfg_get(cfg, 'audio_output_folder', self.audio_output_folder, str)
+            self.audio_duplicate_action = self._cfg_get(cfg, 'audio_duplicate_action', self.audio_duplicate_action, str)
+            self.history_enabled = self._cfg_get(cfg, 'history_enabled', self.history_enabled, bool)
+            self.remember_window = self._cfg_get(cfg, 'remember_window', self.remember_window, bool)
+            self.window_geometry = self._cfg_get(cfg, 'window_geometry', self.window_geometry, str)
+            self.window_maximized = self._cfg_get(cfg, 'window_maximized', self.window_maximized, bool)
             # Migrate old 'm4a' value to 'm4a_native'
             if self.audio_only_format == 'm4a':
                 self.audio_only_format = 'm4a_native'
@@ -13126,6 +14584,9 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 self._audio_format_var.set(_dm.get(self.audio_only_format, self.audio_only_format.upper()))
         except Exception as e:
             print('Could not load config: ' + str(e))
+        if getattr(self, '_cfg_bad_keys', None):
+            print('Config: kept previous values for unreadable keys: '
+                  + ', '.join(self._cfg_bad_keys))
         # Load download history from separate file
         self._load_download_history()
 
@@ -13142,7 +14603,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
 
     def _save_config_now(self):
         """Save persistent configuration to ysa_config.json."""
-        config_file = os.path.join(SCRIPT_DIR, 'ysa_config.json')
+        config_file = os.path.join(SCRIPT_DIR, getattr(self, 'config_filename', 'ysa_config.json'))
         try:
             pvar = getattr(self, 'persistent_cache_var', None)
             dmvar = getattr(self, 'dark_mode_var', None)
@@ -13193,6 +14654,21 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 'preferred_video_bitrate': self.preferred_video_bitrate,
                 'audio_only_mode': self.audio_only_mode.get() if hasattr(self, 'audio_only_mode') else self.audio_only_mode_default,
                 'audio_only_format': getattr(self, 'audio_only_format', 'm4a'),
+                'audio_opus_naming': getattr(self, 'audio_opus_naming', 'codec'),
+                'audio_bitrate_policy': getattr(self, 'audio_bitrate_policy', 'match_source'),
+                'audio_fixed_bitrate': getattr(self, 'audio_fixed_bitrate', 128),
+                'audio_drc_pref': getattr(self, 'audio_drc_pref', 'avoid'),
+                'audio_quality_tag': getattr(self, 'audio_quality_tag', 'audio'),
+                'audio_no_aac_action': getattr(self, 'audio_no_aac_action', 'transcode'),
+                'audio_cache_streams': getattr(self, 'audio_cache_streams', True),
+                'audio_output_folder': getattr(self, 'audio_output_folder', ''),
+                'audio_duplicate_action': getattr(self, 'audio_duplicate_action', 'number'),
+                'history_enabled': (self._history_enabled_var.get()
+                                    if hasattr(self, '_history_enabled_var')
+                                    else getattr(self, 'history_enabled', True)),
+                'remember_window': getattr(self, 'remember_window', True),
+                'window_geometry': getattr(self, 'window_geometry', ''),
+                'window_maximized': getattr(self, 'window_maximized', False),
             }
             tmp_file = config_file + '.tmp'
             with open(tmp_file, 'w') as f:
@@ -13240,6 +14716,10 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 pass
 
     def _record_download(self, file_path, url, video_info, quality, download_time):
+        # History recording can be switched off from the History tab. Read
+        # the plain mirror, not the Tk variable - this runs on worker threads.
+        if not getattr(self, '_m_history_on', getattr(self, 'history_enabled', True)):
+            return
         """Record a completed download in the history list.
         Deduplicates by video_id (or URL fallback) - if the same video is
         downloaded again, the existing entry is updated rather than duplicated."""
@@ -13530,6 +15010,43 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         self._cache_size_bytes = total
         return total / (1024.0 * 1024.0)
 
+    def _is_cache_protected(self, file_path):
+        """True if this cached file must not be evicted right now."""
+        try:
+            _n = os.path.normcase(os.path.abspath(file_path))
+            with self._cache_lock:
+                if _n in self._cache_inuse:
+                    return True
+            # Anything cached in the last two minutes is almost certainly
+            # about to be used by whatever just wrote it.
+            return (time.time() - os.path.getmtime(file_path)) < 120
+        except Exception:
+            return True          # cannot tell -> leave it alone
+
+    def _mark_cache_inuse(self, *paths):
+        """Protect cached files a running download is about to read.
+
+        Eviction is triggered from cache_video_stream / cache_audio_stream -
+        i.e. WHILE a download is in progress - and deletes oldest-first. A
+        stream cached in an earlier session is both the oldest thing in the
+        cache and exactly what a queued merge may be about to read, and
+        nothing tracked that.
+        """
+        try:
+            with self._cache_lock:
+                for p in paths:
+                    if p:
+                        self._cache_inuse.add(os.path.normcase(os.path.abspath(p)))
+        except Exception:
+            pass
+
+    def _clear_cache_inuse(self):
+        try:
+            with self._cache_lock:
+                self._cache_inuse.clear()
+        except Exception:
+            pass
+
     def _evict_cache_if_needed(self):
         """Delete oldest cached files until total cache is under max_cache_mb.
         Uses the incremental _cache_size_bytes counter - no os.walk scan needed."""
@@ -13547,6 +15064,8 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                     continue
                 if file_path and os.path.exists(file_path):
                     try:
+                        if self._is_cache_protected(file_path):
+                            continue
                         mtime = os.path.getmtime(file_path)
                         # Use stored size from metadata to avoid extra stat() calls
                         stored_size = (self.cache_metadata.get('videos', {})
@@ -13562,6 +15081,8 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             for cache_key, file_path in list(subs.items()):
                 if file_path and os.path.exists(file_path):
                     try:
+                        if self._is_cache_protected(file_path):
+                            continue
                         mtime = os.path.getmtime(file_path)
                         size = os.path.getsize(file_path)
                         entries.append((mtime, file_path, 'subtitle', video_id, cache_key, size))
@@ -13920,7 +15441,11 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             log('Latest version: ' + (latest_ver or 'unknown') + '\n', 'info')
             log('Downloading: ' + asset_url + '\n', 'info')
 
-            zip_tmp = os.path.join(tempfile.gettempdir(), 'ffmpeg_update.zip')
+            # ~90 MB - belongs in the app's temp folder, not the user's
+            # Windows temp, where nothing cleans it up on our schedule.
+            self._ensure_cache_dirs()
+            _zip_dir = getattr(self, 'ysa_tmp_dir', None) or tempfile.gettempdir()
+            zip_tmp = os.path.join(_zip_dir, 'ffmpeg_update.zip')
 
             try:
                 resp = requests.get(asset_url, stream=True, timeout=120)
