@@ -472,6 +472,17 @@ _YT_AUDIO_VORBIS_IDS = {'171', '172'}
 
 def find_ytdlp_executable():
     """Find yt-dlp executable in order of preference"""
+    # Test override: point the app at a stub yt-dlp so failure paths (416,
+    # 403, crash-at-exit, disk-full) can be provoked offline and on demand.
+    # Purely additive - when YSA_YTDLP_PATH is unset nothing below changes.
+    try:
+        _override = (os.environ.get('YSA_YTDLP_PATH') or '').strip().strip('"')
+        if _override and os.path.exists(_override):
+            print('Using yt-dlp override from YSA_YTDLP_PATH: ' + _override)
+            return _override
+    except Exception:
+        pass
+
     # Method 1: Check in bundle/script directory
     if getattr(sys, 'frozen', False):
         # Running as PyInstaller executable
@@ -1295,6 +1306,12 @@ class YouTubeStreamAnalyzerGUI:
         self.window_maximized = False
         self.devtest_scenario_file = ''  # dev tools: last scenario file used
         self.devtest_selected = []       # dev tools: scenario names to run ([] = all)
+        self.stub_enabled = False        # dev tools: fake yt-dlp active
+        self.stub_mode = 'ok'            # dev tools: which failure to simulate
+        self.stub_fail_times = 0         # dev tools: fail N times, then succeed
+        self._real_ytdlp_path = None     # remembered so the stub can be undone
+        self._real_cache_dirname = None  # ditto for the cache + output folder
+        self._real_download_path = None
 
         # Load persistent configuration (overrides defaults above)
         self._load_config()
@@ -1629,6 +1646,19 @@ class YouTubeStreamAnalyzerGUI:
                                     command=self.show_debug_info, state='disabled')
         self.debug_btn.pack(side=tk.LEFT, padx=(5, 0))
 
+        # === BEGIN DEV TOOLS ===
+        if DEV_MODE:
+            try:
+                ttk.Style().configure('Stub.TButton', foreground='#b03030')
+            except Exception:
+                pass
+            self.stub_btn = ttk.Button(terminal_controls, text="\U0001f9ea Stub",
+                                       command=self._show_stub_menu)
+            self.stub_btn.pack(side=tk.LEFT, padx=(5, 0))
+            # restore whatever was left enabled last session
+            self.root.after(300, lambda: self._apply_stub_state(announce=True))
+        # === END DEV TOOLS ===
+
         # Auto-scroll checkbox
         self.auto_scroll = tk.BooleanVar(value=True)
         auto_scroll_cb = ttk.Checkbutton(terminal_controls, text="Auto-scroll", 
@@ -1726,6 +1756,127 @@ class YouTubeStreamAnalyzerGUI:
                 _cb(line, 'devevent')
             except Exception:
                 pass
+
+    def _notify(self, title, message, kind='info'):
+        """Modal notice that closes on any click or key press, centred on the app.
+
+        Replaces the OK-only messagebox dialogs, which open wherever the OS
+        decides and force a trip to the OK button. Blocks exactly like the
+        original (wait_window), so callers that assume the dialog is gone
+        before the next statement keep working.
+
+        Safety: never touches Tk off the main thread, and falls back to the
+        original messagebox on ANY failure - a broken notice must never take
+        down the operation that raised it.
+        """
+        _fb = {'info': messagebox.showinfo,
+               'warning': messagebox.showwarning,
+               'error': messagebox.showerror}.get(kind, messagebox.showinfo)
+        try:
+            if threading.current_thread() is not threading.main_thread():
+                # Tk is main-thread only. Show it there and do NOT block the
+                # worker, which is safer than the original behaviour.
+                self.root.after(0, lambda: self._notify(title, message, kind))
+                return 'ok'
+            if not self.root.winfo_exists():
+                return 'ok'
+        except Exception:
+            try:
+                return _fb(title, message)
+            except Exception:
+                return 'ok'
+
+        win = None
+        try:
+            win = tk.Toplevel(self.root)
+            win.withdraw()                      # position it before it is seen
+            win.title(str(title or ''))
+            win.transient(self.root)
+            win.resizable(False, False)
+
+            _accent = {'info': '#2d7d46', 'warning': '#b8860b',
+                       'error': '#b03030'}.get(kind, '#2d7d46')
+            _sym = {'info': 'i', 'warning': '!', 'error': '!'}.get(kind, 'i')
+            _frame = ttk.Frame(win, padding=(18, 14, 18, 12))
+            _frame.pack(fill=tk.BOTH, expand=True)
+            tk.Label(_frame, text=_sym, font=('Arial', 15, 'bold'),
+                     fg=_accent).grid(row=0, column=0, sticky=tk.N, padx=(0, 12))
+            tk.Label(_frame, text=str(message), justify=tk.LEFT,
+                     wraplength=460).grid(row=0, column=1, sticky=tk.W)
+            tk.Label(_frame, text='Click anywhere or press any key to close',
+                     font=('Arial', 8), fg='gray').grid(
+                row=1, column=0, columnspan=2, sticky=tk.W, pady=(12, 0))
+
+            _done = {'v': False}
+
+            def _close(_e=None):
+                if _done['v']:
+                    return
+                _done['v'] = True
+                try:
+                    win.grab_release()
+                except Exception:
+                    pass
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+
+            def _bind_dismiss(w):
+                # bind on every descendant: a click on the label would not
+                # reach a handler bound only to the Toplevel
+                try:
+                    w.bind('<Button-1>', _close)
+                    w.bind('<Key>', _close)
+                    for _c in w.winfo_children():
+                        _bind_dismiss(_c)
+                except Exception:
+                    pass
+            _bind_dismiss(win)
+            win.protocol('WM_DELETE_WINDOW', _close)
+
+            win.update_idletasks()
+            _ww, _wh = win.winfo_reqwidth(), win.winfo_reqheight()
+            try:
+                _px, _py = self.root.winfo_rootx(), self.root.winfo_rooty()
+                _pw, _ph = self.root.winfo_width(), self.root.winfo_height()
+            except Exception:
+                _px = _py = _pw = _ph = 0
+            if _pw > 1 and _ph > 1:
+                _x = _px + max(0, (_pw - _ww) // 2)
+                _y = _py + max(0, (_ph - _wh) // 2)
+            else:
+                _x = max(0, (win.winfo_screenwidth() - _ww) // 2)
+                _y = max(0, (win.winfo_screenheight() - _wh) // 2)
+            win.geometry('+' + str(int(_x)) + '+' + str(int(_y)))
+            win.deiconify()
+            win.lift()
+            try:
+                win.focus_force()
+                win.grab_set()
+            except Exception:
+                pass
+            self.root.wait_window(win)
+            return 'ok'
+        except Exception:
+            try:
+                if win is not None:
+                    win.destroy()
+            except Exception:
+                pass
+            try:
+                return _fb(title, message)
+            except Exception:
+                return 'ok'
+
+    def _notify_info(self, title, message):
+        return self._notify(title, message, 'info')
+
+    def _notify_warning(self, title, message):
+        return self._notify(title, message, 'warning')
+
+    def _notify_error(self, title, message):
+        return self._notify(title, message, 'error')
 
     def _mk_var_mirror(self, var, attr, cast=bool):
         """Mirror a Tk variable into a plain attribute via a write-trace (M3).
@@ -1862,7 +2013,7 @@ class YouTubeStreamAnalyzerGUI:
 
     def run_ytdlp_command_with_terminal(self, args, capture_output=False, timeout=30):
         """Run yt-dlp command with terminal output"""
-        cmd = [self.ytdlp_path] + args
+        cmd = self._ytdlp_head() + args
 
         try:
             if capture_output:
@@ -1999,7 +2150,7 @@ class YouTubeStreamAnalyzerGUI:
         vertically used to clip the panel with no way to reach the rest."""
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
-        _canvas = tk.Canvas(outer, highlightthickness=0, height=170)
+        _canvas = tk.Canvas(outer, highlightthickness=0, height=300)
         _canvas.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.W, tk.E))
         _vsb = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=_canvas.yview)
         _vsb.grid(row=0, column=1, sticky=(tk.N, tk.S))
@@ -2137,13 +2288,28 @@ class YouTubeStreamAnalyzerGUI:
             self.devtest_scenario_file = str(_st.get('scenario_file', '') or '')
             _sel = _st.get('selected', [])
             self.devtest_selected = list(_sel) if isinstance(_sel, list) else []
+            self.stub_enabled = bool(_st.get('stub_enabled', False))
+            self.stub_mode = str(_st.get('stub_mode', 'ok') or 'ok')
+            try:
+                self.stub_fail_times = int(_st.get('stub_fail_times', 0) or 0)
+            except Exception:
+                self.stub_fail_times = 0
+            # The state file existing means the user HAS made a choice, so an
+            # empty list means "none selected" - not "never chosen". Without
+            # this flag, unticking everything read as untouched and every box
+            # came back ticked on the next launch.
+            self._devtest_state_loaded = True
         except Exception as e:
             print('Could not read dev test state: ' + str(e))
 
     def _save_devtest_state(self):
+        self._devtest_state_loaded = True
         try:
             json.dump({'scenario_file': getattr(self, 'devtest_scenario_file', ''),
-                       'selected': list(getattr(self, 'devtest_selected', []) or [])},
+                       'selected': list(getattr(self, 'devtest_selected', []) or []),
+                       'stub_enabled': bool(getattr(self, 'stub_enabled', False)),
+                       'stub_mode': str(getattr(self, 'stub_mode', 'ok')),
+                       'stub_fail_times': int(getattr(self, 'stub_fail_times', 0) or 0)},
                       open(self._devtest_state_path(), 'w', encoding='utf-8'),
                       indent=2)
         except Exception as e:
@@ -2160,7 +2326,20 @@ class YouTubeStreamAnalyzerGUI:
         self._diag_scenarios = []
         _f = getattr(self, 'devtest_scenario_file', '')
         if not _f or not os.path.isfile(_f):
-            ttk.Label(self._diag_list, text="(choose a scenario file)",
+            # Default to the one shipped next to the app - SCRIPT_DIR resolves
+            # to the folder holding the .py or the .exe, so this works either
+            # way and saves browsing for it on a fresh install.
+            _default = os.path.join(SCRIPT_DIR, 'ysa_scenarios.json')
+            if os.path.isfile(_default):
+                _f = _default
+                self.devtest_scenario_file = _f
+                try:
+                    self._diag_file_lbl.config(text=_f)
+                except Exception:
+                    pass
+        if not _f or not os.path.isfile(_f):
+            ttk.Label(self._diag_list,
+                      text="(no ysa_scenarios.json beside the app - choose one)",
                       foreground='gray').grid(row=0, column=0, sticky=tk.W)
             self._diag_update_estimate()
             return
@@ -2174,26 +2353,32 @@ class YouTubeStreamAnalyzerGUI:
             self._diag_update_estimate()
             return
         _saved = set(getattr(self, 'devtest_selected', []) or [])
-        _cols = 2
+        # Two columns, filled downward, height driven by the count. A fixed
+        # 10 per column meant 31 scenarios needed four columns, and columns
+        # three and four ran off the right edge with no horizontal scrollbar -
+        # so only the first 20 were reachable. Vertical overflow scrolls.
+        _per_col = max(1, (len(_scn) + 1) // 2)
         for i, sc in enumerate(_scn):
             _name = sc.get('name', 'scenario ' + str(i + 1))
             _url = sc.get('url', '')
             _unset = (_url.startswith('@')
                       and str(_ph.get(_url[1:], '@')).startswith('@'))
             _est = int(sc.get('est_sec', 0) or 0)
-            _label = str(i + 1) + '. ' + _name[:46]
+            _label = str(i + 1) + '. ' + _name[:40]
             if _est:
                 _label += '  (~' + (str(_est) + 's' if _est < 90
                                     else str(round(_est / 60.0, 1)) + 'm') + ')'
             if _unset:
                 _label += '  [no URL]'
             # default: everything selected the first time
-            _var = tk.BooleanVar(value=(_name in _saved) if _saved else True)
+            _chosen = getattr(self, '_devtest_state_loaded', False)
+            _var = tk.BooleanVar(value=(_name in _saved) if _chosen else True)
             self._diag_sel_vars[_name] = _var
             self._diag_scenarios.append((_name, _est, _unset))
             _cb = ttk.Checkbutton(self._diag_list, text=_label, variable=_var,
                                   command=self._diag_selection_changed)
-            _cb.grid(row=i // _cols, column=i % _cols, sticky=tk.W, padx=(0, 14))
+            _cb.grid(row=i % _per_col, column=i // _per_col,
+                     sticky=tk.W, padx=(0, 14))
             if _unset:
                 _var.set(False)
         self._diag_update_estimate()
@@ -2266,17 +2451,17 @@ class YouTubeStreamAnalyzerGUI:
     def _diag_run(self):
         _f = getattr(self, 'devtest_scenario_file', '')
         if not _f or not os.path.isfile(_f):
-            messagebox.showwarning("Diagnostics", "Choose a scenario file first.")
+            self._notify_warning("Diagnostics", "Choose a scenario file first.")
             return
         try:
             import ysa_devtest
         except Exception as _e:
-            messagebox.showerror("Diagnostics",
+            self._notify_error("Diagnostics",
                                  "ysa_devtest.py could not be imported:\n" + str(_e))
             return
         _r = getattr(self, '_devtest_runner', None)
         if _r is not None and _r.is_running():
-            messagebox.showinfo("Diagnostics", "A run is already in progress.")
+            self._notify_info("Diagnostics", "A run is already in progress.")
             return
         try:
             self._diag_text.config(state='normal')
@@ -2289,7 +2474,7 @@ class YouTubeStreamAnalyzerGUI:
             pass
         _only = [n for n, v in getattr(self, '_diag_sel_vars', {}).items() if v.get()]
         if not _only:
-            messagebox.showwarning("Diagnostics", "No scenarios are selected.")
+            self._notify_warning("Diagnostics", "No scenarios are selected.")
             try:
                 self._diag_run_btn.config(state='normal')
                 self._diag_stop_btn.config(state='disabled')
@@ -3836,9 +4021,209 @@ class YouTubeStreamAnalyzerGUI:
                 'Warning: could not patch subtitle flag: ' + str(_e) + '\n', 'warning')
             return False
 
+    # === BEGIN DEV TOOLS ===
+    STUB_MODES = ('ok', 'http416', 'crash_at_exit', 'bot_check', 'http403',
+                  'terminated', 'format_expired', 'partial', 'disk_full', 'slow')
+
+    def _stub_path(self):
+        """Locate the fake yt-dlp beside the app.
+
+        Prefers the compiled .exe - it is directly executable, needs no
+        cmd.exe (which may be blocked by policy) and no Python, and keeps the
+        real subprocess boundary so Pause can still kill it.
+        """
+        for name in ('ysa_fake_ytdlp.exe', 'ysa_fake_ytdlp.py'):
+            p = os.path.join(SCRIPT_DIR, name)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _apply_stub_state(self, announce=True):
+        """Point the app at the stub (or back at the real yt-dlp).
+
+        Mode changes need no restart: the stub reads YSA_FAKE_MODE when it is
+        spawned, and a child process inherits this one's environment.
+        """
+        try:
+            if self._real_ytdlp_path is None:
+                self._real_ytdlp_path = self.ytdlp_path
+            _r = getattr(self, '_devtest_runner', None)
+            if _r is not None and _r.is_running():
+                self.append_terminal_output(
+                    "Cannot change the stub while a scenario run is in"
+                    " progress - it manages the cache sandbox itself.\n",
+                    "warning")
+                self.stub_enabled = not self.stub_enabled   # undo the toggle
+                self._refresh_stub_button()
+                return
+            _p = self._stub_path()
+            if self.stub_enabled and _p:
+                os.environ['YSA_YTDLP_PATH'] = _p
+                os.environ['YSA_FAKE_MODE'] = str(self.stub_mode or 'ok')
+                os.environ['YSA_FAKE_STATE'] = SCRIPT_DIR
+                if int(self.stub_fail_times or 0) > 0:
+                    os.environ['YSA_FAKE_FAIL_TIMES'] = str(int(self.stub_fail_times))
+                else:
+                    os.environ.pop('YSA_FAKE_FAIL_TIMES', None)
+                # the invocation counter is per-session; start each enable
+                # from scratch so "fail the first N" means what it says
+                try:
+                    _c = os.path.join(SCRIPT_DIR, '.ysa_fake_count')
+                    if os.path.isfile(_c):
+                        os.remove(_c)          # legacy single-file counter
+                    shutil.rmtree(os.path.join(SCRIPT_DIR, '.ysa_fake_calls'),
+                                  ignore_errors=True)
+                except Exception:
+                    pass
+                self.ytdlp_path = _p
+
+                # Fake streams must never reach the real cache or the real
+                # download folder. A stubbed download is cached under the
+                # video's genuine id and format, so without this a later
+                # REAL download of that video would be served 1.8 MB of
+                # zeros - and the output lands in the user's library.
+                if self._real_cache_dirname is None:
+                    self._real_cache_dirname = getattr(self, 'cache_dirname',
+                                                       'ysa_cache')
+                    self._real_download_path = self.download_path
+                # Share the dev sandbox rather than a third folder: same
+                # cache, same session logs, one place to look.
+                self.cache_dirname = 'ysa_cache_dev'
+                self.setup_cache_directories()
+                try:
+                    _so = os.path.join(SCRIPT_DIR, 'selftest_output')
+                    os.makedirs(_so, exist_ok=True)
+                    self.download_path = _so
+                except Exception:
+                    pass
+            else:
+                if self.stub_enabled and not _p:
+                    self.stub_enabled = False
+                for _k in ('YSA_YTDLP_PATH', 'YSA_FAKE_MODE',
+                           'YSA_FAKE_FAIL_TIMES', 'YSA_FAKE_STATE'):
+                    os.environ.pop(_k, None)
+                if self._real_ytdlp_path:
+                    self.ytdlp_path = self._real_ytdlp_path
+                # put the real cache and download folder back
+                if self._real_cache_dirname is not None:
+                    self.cache_dirname = self._real_cache_dirname
+                    self.setup_cache_directories()
+                    if self._real_download_path:
+                        self.download_path = self._real_download_path
+                    self._real_cache_dirname = None
+                    self._real_download_path = None
+            self._refresh_stub_button()
+            if announce:
+                if self.stub_enabled:
+                    self.append_terminal_output(
+                        "*** TEST STUB ENABLED *** downloads are FAKE - mode: "
+                        + str(self.stub_mode)
+                        + (", failing first " + str(self.stub_fail_times)
+                           if int(self.stub_fail_times or 0) > 0 else "")
+                        + "\n    cache -> ysa_cache_dev   output -> selftest_output"
+                        + "   (your real cache and library are untouched)\n",
+                        "warning")
+                else:
+                    self.append_terminal_output(
+                        "Test stub disabled - using the real yt-dlp: "
+                        + str(self.ytdlp_path) + "\n    cache -> "
+                        + str(getattr(self, 'cache_dirname', 'ysa_cache'))
+                        + "   output -> " + str(self.download_path) + "\n",
+                        "success")
+        except Exception as e:
+            print('stub state error: ' + str(e))
+
+    def _refresh_stub_button(self):
+        try:
+            if not hasattr(self, 'stub_btn') or not self.stub_btn.winfo_exists():
+                return
+            if getattr(self, 'stub_enabled', False):
+                # Loud on purpose: forgetting the stub is on and then
+                # debugging a "broken" 1.8 MB download is the real hazard.
+                self.stub_btn.config(text="\U0001f9ea STUB: " + str(self.stub_mode),
+                                     style='Stub.TButton')
+            else:
+                self.stub_btn.config(text="\U0001f9ea Stub", style='TButton')
+        except Exception:
+            pass
+
+    def _show_stub_menu(self):
+        try:
+            _p = self._stub_path()
+            m = tk.Menu(self.root, tearoff=0)
+            if not _p:
+                m.add_command(label="ysa_fake_ytdlp.exe / .py not found beside the app",
+                              state='disabled')
+                m.add_separator()
+                m.add_command(label="(build it with the GitHub workflow, or copy the .py here)",
+                              state='disabled')
+            else:
+                self._stub_on_var = tk.BooleanVar(value=bool(self.stub_enabled))
+                m.add_checkbutton(label="Use fake yt-dlp  (" + os.path.basename(_p) + ")",
+                                  variable=self._stub_on_var,
+                                  command=self._toggle_stub)
+                m.add_separator()
+                self._stub_mode_var = tk.StringVar(value=str(self.stub_mode))
+                for _mode in self.STUB_MODES:
+                    m.add_radiobutton(label=_mode, value=_mode,
+                                      variable=self._stub_mode_var,
+                                      command=self._set_stub_mode)
+                m.add_separator()
+                _sub = tk.Menu(m, tearoff=0)
+                self._stub_fail_var = tk.IntVar(value=int(self.stub_fail_times or 0))
+                for _n in (0, 1, 2, 3, 5):
+                    _sub.add_radiobutton(
+                        label=("off" if _n == 0 else "fail " + str(_n) + ", then succeed"),
+                        value=_n, variable=self._stub_fail_var,
+                        command=self._set_stub_fail)
+                m.add_cascade(label="Retry behaviour", menu=_sub)
+                m.add_separator()
+                m.add_command(label="Real yt-dlp: " + str(self._real_ytdlp_path
+                                                         or self.ytdlp_path),
+                              state='disabled')
+            _x = self.stub_btn.winfo_rootx()
+            _y = self.stub_btn.winfo_rooty() + self.stub_btn.winfo_height()
+            m.tk_popup(_x, _y)
+            try:
+                m.grab_release()
+            except Exception:
+                pass
+        except Exception as e:
+            print('stub menu error: ' + str(e))
+
+    def _toggle_stub(self):
+        self.stub_enabled = bool(self._stub_on_var.get())
+        self._apply_stub_state()
+        self._save_devtest_state()
+
+    def _set_stub_mode(self):
+        self.stub_mode = str(self._stub_mode_var.get())
+        self._apply_stub_state()
+        self._save_devtest_state()
+
+    def _set_stub_fail(self):
+        self.stub_fail_times = int(self._stub_fail_var.get())
+        self._apply_stub_state()
+        self._save_devtest_state()
+    # === END DEV TOOLS ===
+
+    def _ytdlp_head(self):
+        """The leading element(s) of a yt-dlp command line.
+
+        Normally just the executable. If the resolved path is a .py - which
+        happens when the developer stub is used while running from source -
+        the interpreter has to come first, because Windows cannot execute a
+        .py file as a subprocess and a .cmd shim needs cmd.exe, which may be
+        blocked by policy.
+        """
+        p = str(self.ytdlp_path or '')
+        if p.lower().endswith('.py'):
+            return [sys.executable, p]
+        return [p]
+
     def run_ytdlp_command(self, args, capture_output=True, timeout=30):
         """Run yt-dlp command with the executable"""
-        cmd = [self.ytdlp_path] + args
+        cmd = self._ytdlp_head() + args
         try:
             result = subprocess.run(cmd, capture_output=capture_output, text=True, encoding='utf-8', errors='replace', timeout=timeout,
                                            creationflags=CREATE_NO_WINDOW)
@@ -4389,7 +4774,7 @@ class YouTubeStreamAnalyzerGUI:
             probe_args += self.get_bgutil_plugin_dirs_args()
             probe_args += self.get_jsruntime_args()
             probe_args.append('ysa://probe')
-            cmd = [self.ytdlp_path] + probe_args
+            cmd = self._ytdlp_head() + probe_args
             result = subprocess.run(
                 cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
                 creationflags=CREATE_NO_WINDOW)
@@ -5027,7 +5412,7 @@ class YouTubeStreamAnalyzerGUI:
                 self._batch_text.delete('1.0', tk.END)
                 self._batch_text.insert('1.0', content)
             except Exception as ex:
-                messagebox.showerror("Load File", "Could not read file:\n" + str(ex))
+                self._notify_error("Load File", "Could not read file:\n" + str(ex))
 
         def _batch_clear():
             self._batch_text.delete('1.0', tk.END)
@@ -5039,11 +5424,11 @@ class YouTubeStreamAnalyzerGUI:
             valid = [u for u in urls
                      if self.is_valid_youtube_url(u) or self.is_playlist_url(u)]
             if not valid:
-                messagebox.showwarning("Batch", "No valid YouTube URLs found.\n"
+                self._notify_warning("Batch", "No valid YouTube URLs found.\n"
                                        "Add one URL per line.")
                 return
             if not self.default_quality:
-                messagebox.showwarning("Batch",
+                self._notify_warning("Batch",
                     "Auto-Download is disabled.\n"
                     "Enable it and select a quality so each video knows what to queue.")
                 return
@@ -5146,7 +5531,7 @@ class YouTubeStreamAnalyzerGUI:
                 elif os.name == 'posix':  # macOS and Linux
                     subprocess.run(['open' if sys.platform == 'darwin' else 'xdg-open', self.download_path])
             except Exception as e:
-                messagebox.showerror("Error", f"Could not open folder: {str(e)}")
+                self._notify_error("Error", f"Could not open folder: {str(e)}")
         
         self.open_folder_btn = ttk.Button(download_frame, text="Open Folder", command=open_download_folder)
         self.open_folder_btn.grid(row=0, column=3, sticky=tk.W)
@@ -5207,7 +5592,7 @@ class YouTubeStreamAnalyzerGUI:
         # ── Smart Quality (row 3, replaces old multi-button cache row) ───────
         def _open_cache_dir(path):
             if not path or not os.path.isdir(path):
-                messagebox.showwarning("Open Folder",
+                self._notify_warning("Open Folder",
                     "Folder does not exist:\n" + (path or "Not set"))
                 return
             try:
@@ -5218,7 +5603,7 @@ class YouTubeStreamAnalyzerGUI:
                 else:
                     subprocess.Popen(['xdg-open', path], close_fds=True)
             except Exception as e:
-                messagebox.showerror("Open Folder", "Could not open folder:\n" + str(e))
+                self._notify_error("Open Folder", "Could not open folder:\n" + str(e))
 
         ttk.Label(download_frame, text="Smart Quality:", font=('Arial', 9, 'bold')).grid(
             row=3, column=0, sticky=tk.W, pady=(6, 2))
@@ -5667,7 +6052,7 @@ class YouTubeStreamAnalyzerGUI:
         lives inside the cache folder, so deleting it mid-flight would rip
         files out from under yt-dlp/FFmpeg."""
         if not self.ysa_cache_root:
-            messagebox.showinfo("Cache", "Caching is disabled")
+            self._notify_info("Cache", "Caching is disabled")
             return
 
         # Refuse while anything is actively using the folder
@@ -5680,7 +6065,7 @@ class YouTubeStreamAnalyzerGUI:
             except Exception:
                 pass
         if _busy:
-            messagebox.showwarning(
+            self._notify_warning(
                 "Clear Cache",
                 "A download or pre-cache is in progress.\n\n"
                 "Stop or finish downloads first, then clear the cache.")
@@ -5715,8 +6100,30 @@ class YouTubeStreamAnalyzerGUI:
             self._kill_all_ffmpeg()
             time.sleep(0.5)
 
-            shutil.rmtree(self.ysa_cache_root, ignore_errors=True)
-            _leftover = os.path.isdir(self.ysa_cache_root)
+            # Clear EVERY cache folder, not just the active one. With the
+            # stub or a scenario run engaged, ysa_cache_root points at
+            # ysa_cache_dev - so the old code cleared the sandbox and left the
+            # real cache untouched while reporting "Cache folder deleted".
+            # ysa_cache_stub is the pre-merge stub folder; still removed so an
+            # upgraded install does not keep it forever.
+            _targets, _seen = [], set()
+            for _t in ([self.ysa_cache_root]
+                       + [os.path.join(SCRIPT_DIR, _n) for _n in
+                          ('ysa_cache', 'ysa_cache_dev', 'ysa_cache_stub')]):
+                if not _t:
+                    continue
+                _k = os.path.normcase(os.path.abspath(_t))
+                if _k in _seen:
+                    continue
+                _seen.add(_k)
+                _targets.append(_t)
+            _removed = []
+            for _t in _targets:
+                if os.path.isdir(_t):
+                    shutil.rmtree(_t, ignore_errors=True)
+                    if not os.path.isdir(_t):
+                        _removed.append(os.path.basename(_t.rstrip('\\/')))
+            _leftover = any(os.path.isdir(_t) for _t in _targets)
 
             # The folder is deliberately NOT recreated here: "clear the cache"
             # should leave nothing on disk, not an empty shell. The structure
@@ -5741,15 +6148,15 @@ class YouTubeStreamAnalyzerGUI:
                     " exit.\n", 'warning')
             else:
                 self.append_terminal_output(
-                    "Cache folder deleted. It will be recreated automatically"
-                    " on the next download (session logging resumes then).\n",
-                    'success')
-            messagebox.showinfo("Cache", "Cache cleared")
+                    "Deleted: " + (", ".join(_removed) if _removed else "nothing")
+                    + ". Recreated automatically on the next download"
+                    " (session logging resumes then).\n", 'success')
+            self._notify_info("Cache", "Cache cleared")
             self.status_var.set("Cache cleared")
             self.root.after(0, self._update_cache_size_label)
 
         except Exception as e:
-            messagebox.showerror("Error", "Failed to clear cache: " + str(e))
+            self._notify_error("Error", "Failed to clear cache: " + str(e))
 
     def setup_stream_treeview(self, parent, stream_type):
         """Set up treeview for displaying streams"""
@@ -6028,11 +6435,11 @@ class YouTubeStreamAnalyzerGUI:
         url = self.url_var.get().strip()
 
         if not url:
-            messagebox.showerror("Error", "Please enter a YouTube URL")
+            self._notify_error("Error", "Please enter a YouTube URL")
             return
 
         if not self.is_valid_youtube_url(url) and not self.is_playlist_url(url):
-            messagebox.showerror("Error", "Invalid YouTube URL format")
+            self._notify_error("Error", "Invalid YouTube URL format")
             return
 
         # Playlists use a separate worker - bypass the analysis queue entirely
@@ -6182,7 +6589,7 @@ class YouTubeStreamAnalyzerGUI:
                                                         self.yt_dlp_cache_dir])
                                     _aargs.append(_url)
                                     _res = subprocess.run(
-                                        [self.ytdlp_path] + _aargs,
+                                        self._ytdlp_head() + _aargs,
                                         capture_output=True, text=True, encoding='utf-8', errors='replace',
                                         timeout=3600,
                                         creationflags=CREATE_NO_WINDOW)
@@ -6273,12 +6680,12 @@ class YouTubeStreamAnalyzerGUI:
             clipboard_content = self.root.clipboard_get().strip()
 
             if not clipboard_content:
-                messagebox.showwarning("Warning", "Clipboard is empty")
+                self._notify_warning("Warning", "Clipboard is empty")
                 self.status_var.set("Ready")
                 return
 
             if not self.is_valid_youtube_url(clipboard_content) and not self.is_playlist_url(clipboard_content):
-                messagebox.showerror("Error", "Clipboard does not contain a valid YouTube URL")
+                self._notify_error("Error", "Clipboard does not contain a valid YouTube URL")
                 self.status_var.set("Ready")
                 return
 
@@ -6288,10 +6695,10 @@ class YouTubeStreamAnalyzerGUI:
             self.analyze_video()
             
         except tk.TclError:
-            messagebox.showerror("Error", "Could not access clipboard")
+            self._notify_error("Error", "Could not access clipboard")
             self.status_var.set("Ready")
         except Exception as e:
-            messagebox.showerror("Error", f"Error pasting URL: {str(e)}")
+            self._notify_error("Error", f"Error pasting URL: {str(e)}")
             self.status_var.set("Ready")
     
     def on_paste_to_entry(self, event):
@@ -7067,7 +7474,7 @@ class YouTubeStreamAnalyzerGUI:
     
     def _show_error(self, message):
         """Show error message and reset UI"""
-        messagebox.showerror("Error", message)
+        self._notify_error("Error", message)
         self.progress_bar.stop()
         self.progress_var.set("Ready")
         self.paste_btn.config(state='normal')
@@ -7091,7 +7498,7 @@ class YouTubeStreamAnalyzerGUI:
         
         selection = tree.selection()
         if not selection:
-            messagebox.showwarning("Warning", "Please select a stream first")
+            self._notify_warning("Warning", "Please select a stream first")
             return
         
         # Get format ID from selected item
@@ -7099,7 +7506,7 @@ class YouTubeStreamAnalyzerGUI:
         values = item['values']
         
         if not values:
-            messagebox.showerror("Error", "No data found for selected stream")
+            self._notify_error("Error", "No data found for selected stream")
             return
             
         format_id = values[-1]  # Format ID is always the last column
@@ -7107,7 +7514,7 @@ class YouTubeStreamAnalyzerGUI:
         # Debug information
         
         if not format_id or str(format_id).strip() == '':
-            messagebox.showerror("Error", "No format ID found for selected stream")
+            self._notify_error("Error", "No format ID found for selected stream")
             return
         
         # Get stream URL in separate thread
@@ -7127,7 +7534,7 @@ class YouTubeStreamAnalyzerGUI:
             
                 
             if not format_id or format_id == 'None':
-                self.root.after(0, lambda: messagebox.showerror("Error", "Invalid format ID"))
+                self.root.after(0, lambda: self._notify_error("Error", "Invalid format ID"))
                 return
             
             # Use yt-dlp to get the stream URL (attempt 1: default + cookies)
@@ -7156,7 +7563,7 @@ class YouTubeStreamAnalyzerGUI:
 
             if result.returncode != 0:
                 error_msg = 'Failed to get stream URL: ' + (result.stderr or '').strip()
-                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                self.root.after(0, lambda: self._notify_error("Error", error_msg))
                 return
             
             stream_url = result.stdout.strip()
@@ -7172,11 +7579,11 @@ class YouTubeStreamAnalyzerGUI:
                 
                 self.root.after(0, lambda: self._show_stream_url(stream_url, target_format))
             else:
-                self.root.after(0, lambda: messagebox.showerror("Error", "Could not retrieve stream URL"))
+                self.root.after(0, lambda: self._notify_error("Error", "Could not retrieve stream URL"))
                     
         except Exception as e:
             error_msg = f"Error getting stream URL: {str(e)}"
-            self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+            self.root.after(0, lambda: self._notify_error("Error", error_msg))
         finally:
             self.root.after(0, lambda: self.status_var.set("Ready"))
     
@@ -7220,7 +7627,7 @@ File Size: {self.format_file_size(format_info.get('filesize'))}"""
         def copy_url():
             self.root.clipboard_clear()
             self.root.clipboard_append(stream_url)
-            messagebox.showinfo("Copied", "URL copied to clipboard!")
+            self._notify_info("Copied", "URL copied to clipboard!")
         
         def open_url():
             webbrowser.open(stream_url)
@@ -7237,7 +7644,7 @@ File Size: {self.format_file_size(format_info.get('filesize'))}"""
     def copy_video_info(self):
         """Copy video information to clipboard"""
         if not self.current_video_info:
-            messagebox.showwarning("Warning", "No video information available")
+            self._notify_warning("Warning", "No video information available")
             return
         
         info = self.current_video_info
@@ -7254,7 +7661,7 @@ Total Streams: {len(self.current_formats)}"""
         
         self.root.clipboard_clear()
         self.root.clipboard_append(info_text)
-        messagebox.showinfo("Copied", "Video information copied to clipboard!")
+        self._notify_info("Copied", "Video information copied to clipboard!")
     
     def on_stream_double_click(self, event, tree):
         """Handle double-click on stream item"""
@@ -7316,7 +7723,7 @@ Total Streams: {len(self.current_formats)}"""
     def show_debug_info(self):
         """Show debug information about the current video including cache status"""
         if not self.current_video_info:
-            messagebox.showwarning("Warning", "No video information available")
+            self._notify_warning("Warning", "No video information available")
             return
 
         dialog = tk.Toplevel(self.root)
@@ -7411,7 +7818,7 @@ Total Streams: {len(self.current_formats)}"""
          self._show_settings_impl()
         except Exception as _se:
          import traceback as _tb
-         messagebox.showerror("Settings Error",
+         self._notify_error("Settings Error",
              "Settings failed to open:\n\n" + _tb.format_exc())
 
     def _show_settings_impl(self):
@@ -8207,7 +8614,7 @@ Total Streams: {len(self.current_formats)}"""
         def _open_ysa_root():
             p = getattr(self, 'ysa_cache_root', None)
             if not p or not os.path.isdir(p):
-                messagebox.showwarning("Open Folder",
+                self._notify_warning("Open Folder",
                     "YSA Cache folder does not exist:\n" + (p or "Not set"))
                 return
             try:
@@ -8218,7 +8625,7 @@ Total Streams: {len(self.current_formats)}"""
                 else:
                     subprocess.Popen(['xdg-open', p], close_fds=True)
             except Exception as e:
-                messagebox.showerror("Open Folder", "Could not open folder:\n" + str(e))
+                self._notify_error("Open Folder", "Could not open folder:\n" + str(e))
 
         ysa_root_frame = ttk.Frame(tab_cache)
         ysa_root_frame.grid(row=0, column=0, columnspan=3, sticky=tk.W, padx=8, pady=(10, 4))
@@ -8278,7 +8685,7 @@ Total Streams: {len(self.current_formats)}"""
         def _open_folder(path):
             """Open a folder in Windows Explorer (or file manager on other OS)."""
             if not path or not os.path.isdir(path):
-                messagebox.showwarning("Cache Folder",
+                self._notify_warning("Cache Folder",
                     "Cache folder does not exist or is not set:\n" + (path or "None"))
                 return
             try:
@@ -8289,7 +8696,7 @@ Total Streams: {len(self.current_formats)}"""
                 else:
                     subprocess.Popen(['xdg-open', path], close_fds=True)
             except Exception as e:
-                messagebox.showerror("Open Folder", "Could not open folder:\n" + str(e))
+                self._notify_error("Open Folder", "Could not open folder:\n" + str(e))
 
         ttk.Label(tab_cache, text="Video Cache Path:", font=('Arial', 8)).grid(
             row=8, column=0, sticky=tk.W, padx=8, pady=2)
@@ -8467,12 +8874,12 @@ Total Streams: {len(self.current_formats)}"""
             _save_bgutil_settings()
             server_path = self.bgutil_server_path
             if not server_path or not os.path.isdir(server_path):
-                messagebox.showwarning("bgutil Setup",
+                self._notify_warning("bgutil Setup",
                     "Please select the server folder first (Browse button above).")
                 return
             pkg_json = os.path.join(server_path, 'package.json')
             if not os.path.isfile(pkg_json):
-                messagebox.showerror("bgutil Setup",
+                self._notify_error("bgutil Setup",
                     "package.json not found in selected folder.\n"
                     "Make sure you selected the 'server' subfolder from the zip.")
                 return
@@ -8487,7 +8894,7 @@ Total Streams: {len(self.current_formats)}"""
                 os.remove(_test_file)
             except OSError:
                 _safe = os.path.join(os.path.expanduser('~'), 'bgutil-server')
-                messagebox.showerror(
+                self._notify_error(
                     "bgutil Setup - Access Denied",
                     "Windows is blocking write access to:\n"
                     + server_path + "\n\n"
@@ -9036,7 +9443,7 @@ Total Streams: {len(self.current_formats)}"""
                     probe_args.extend(['--cache-dir', self.yt_dlp_cache_dir])
                 probe_args.append(url)
                 subprocess.run(
-                    [self.ytdlp_path] + probe_args,
+                    self._ytdlp_head() + probe_args,
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
                     creationflags=CREATE_NO_WINDOW)
             except Exception:
@@ -9152,7 +9559,7 @@ Total Streams: {len(self.current_formats)}"""
                         vargs.extend(['--cache-dir', self.yt_dlp_cache_dir])
                     vargs.append(url)
                     proc = subprocess.Popen(
-                        [self.ytdlp_path] + vargs,
+                        self._ytdlp_head() + vargs,
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                         text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
                     for line in iter(proc.stdout.readline, ''):
@@ -9201,7 +9608,7 @@ Total Streams: {len(self.current_formats)}"""
                         aargs.extend(['--cache-dir', self.yt_dlp_cache_dir])
                     aargs.append(url)
                     proc = subprocess.Popen(
-                        [self.ytdlp_path] + aargs,
+                        self._ytdlp_head() + aargs,
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                         text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
                     _audio_key = video_id + '_audio'
@@ -9264,7 +9671,7 @@ Total Streams: {len(self.current_formats)}"""
                         sargs.extend(self.get_player_client_extractor_args())
                         sargs.extend(self.get_ytdlp_dns_args())
                         sargs.append(url)
-                        subprocess.run([self.ytdlp_path] + sargs, capture_output=True,
+                        subprocess.run(self._ytdlp_head() + sargs, capture_output=True,
                                        text=True, encoding='utf-8', errors='replace', timeout=60, creationflags=CREATE_NO_WINDOW)
                         for f in os.listdir(temp_dir):
                             if f.startswith('presub.') and f.endswith(('.srt', '.vtt', '.ass')):
@@ -9282,7 +9689,7 @@ Total Streams: {len(self.current_formats)}"""
                             if f.startswith('presub.'):
                                 try: os.remove(os.path.join(temp_dir, f))
                                 except Exception: pass
-                        subprocess.run([self.ytdlp_path] + aargs, capture_output=True,
+                        subprocess.run(self._ytdlp_head() + aargs, capture_output=True,
                                        text=True, encoding='utf-8', errors='replace', timeout=60, creationflags=CREATE_NO_WINDOW)
                         for f in os.listdir(temp_dir):
                             if f.startswith('presub.') and f.endswith(('.srt', '.vtt', '.ass')):
@@ -9447,7 +9854,7 @@ Total Streams: {len(self.current_formats)}"""
         tab_text = self.notebook.tab(current_tab, "text")
 
         if "Recommended" not in tab_text:
-            messagebox.showinfo("Info",
+            self._notify_info("Info",
                 "Please select a stream from the 'Recommended' tab for download and merge.\n\n"
                 "The Recommended tab shows the best video+audio combinations with caching support.")
             return
@@ -9471,7 +9878,7 @@ Total Streams: {len(self.current_formats)}"""
         """Download and merge from recommended tab selection with caching"""
         selection = self.recommended_tree.selection()
         if not selection:
-            messagebox.showwarning("Warning", "Please select a stream combination to download")
+            self._notify_warning("Warning", "Please select a stream combination to download")
             # Guard: _download_active may have been set by the caller before
             # invoking this method.  Clear it so the queue is never permanently
             # locked by an early return.
@@ -9504,7 +9911,7 @@ Total Streams: {len(self.current_formats)}"""
             format_id = video_info.split('(')[1].split(')')[0] if '(' in video_info else ''
             
             if not format_id:
-                messagebox.showerror("Error", "Could not extract format ID")
+                self._notify_error("Error", "Could not extract format ID")
                 # C4 fix: caller set _download_active=True before dispatch;
                 # clear it or the queue is permanently locked (mirrors the
                 # guard in download_recommended_selection).
@@ -9530,7 +9937,7 @@ Total Streams: {len(self.current_formats)}"""
                     break
             
             if not target_format:
-                messagebox.showerror("Error", "Format " + format_id + " not found")
+                self._notify_error("Error", "Format " + format_id + " not found")
                 # C4 fix: clear the active flag so the queue can proceed.
                 self._download_active = False
                 self._start_next_queued()
@@ -9581,7 +9988,7 @@ Total Streams: {len(self.current_formats)}"""
         except Exception as e:
             # If thread never started, clear the flag so the queue is not permanently locked
             self._download_active = False
-            messagebox.showerror("Error", "Error starting download: " + str(e))
+            self._notify_error("Error", "Error starting download: " + str(e))
 
     def download_and_merge_combination(self, video_info, audio_info, quality):
         """Download video and audio, then merge them with caching support"""
@@ -9598,7 +10005,7 @@ Total Streams: {len(self.current_formats)}"""
                 audio_format_id = audio_info.split('(')[1].split(')')[0] if '(' in audio_info else ''
             
             if not video_format_id or not audio_format_id:
-                messagebox.showerror("Error", "Could not extract format IDs\nVideo: " + str(video_format_id) + "\nAudio: " + str(audio_format_id))
+                self._notify_error("Error", "Could not extract format IDs\nVideo: " + str(video_format_id) + "\nAudio: " + str(audio_format_id))
                 # C4 fix: clear the active flag so the queue can proceed.
                 self._download_active = False
                 self._start_next_queued()
@@ -9672,7 +10079,7 @@ Total Streams: {len(self.current_formats)}"""
         except Exception as e:
             # If thread never started, clear the flag so the queue is not permanently locked
             self._download_active = False
-            messagebox.showerror("Error", "Error starting download: " + str(e))
+            self._notify_error("Error", "Error starting download: " + str(e))
     
     def _download_direct_worker_with_terminal(self, format_id, output_path, quality, url=None, video_info=None, sub_settings=None, video_id=None):
         """Worker thread for direct download with terminal output"""
@@ -9948,7 +10355,7 @@ Total Streams: {len(self.current_formats)}"""
                                             'Fetching subtitle (' + _d_sub_lang + ', manual)...\n', 'info')
                                     try:
                                         subprocess.run(
-                                            [self.ytdlp_path] + _d_manual_args,
+                                            self._ytdlp_head() + _d_manual_args,
                                             capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
                                             creationflags=CREATE_NO_WINDOW)
                                         for _f in os.listdir(_d_temp_dir):
@@ -9976,7 +10383,7 @@ Total Streams: {len(self.current_formats)}"""
                                             'Fetching subtitle (' + _d_sub_lang + ', auto, up to 60s)...\n', 'info')
                                         try:
                                             subprocess.run(
-                                                [self.ytdlp_path] + _d_auto_args,
+                                                self._ytdlp_head() + _d_auto_args,
                                                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
                                                 creationflags=CREATE_NO_WINDOW)
                                             for _f in os.listdir(_d_temp_dir):
@@ -10607,7 +11014,7 @@ Total Streams: {len(self.current_formats)}"""
 
                     def _download_audio_bg():
                         try:
-                            cmd = [self.ytdlp_path] + audio_args_bg
+                            cmd = self._ytdlp_head() + audio_args_bg
                             proc = subprocess.Popen(
                                 cmd,
                                 stdout=subprocess.PIPE,
@@ -10833,7 +11240,7 @@ Total Streams: {len(self.current_formats)}"""
                                     'Fetching subtitle (' + sub_lang + ', manual)...\n', 'info')
                             try:
                                 _res_manual = subprocess.run(
-                                    [self.ytdlp_path] + sub_args_manual,
+                                    self._ytdlp_head() + sub_args_manual,
                                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
                                     creationflags=CREATE_NO_WINDOW)
                                 for _f in os.listdir(temp_dir):
@@ -10884,7 +11291,7 @@ Total Streams: {len(self.current_formats)}"""
                                         'Fetching subtitle (' + sub_lang + ', auto, up to 60s)...\n', 'info')
                                     try:
                                         _res_auto = subprocess.run(
-                                            [self.ytdlp_path] + sub_args_auto,
+                                            self._ytdlp_head() + sub_args_auto,
                                             capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,
                                             creationflags=CREATE_NO_WINDOW)
                                         for _f in os.listdir(temp_dir):
@@ -11771,7 +12178,7 @@ Total Streams: {len(self.current_formats)}"""
         self.current_video_info during batch re-fetch races."""
         selection = self.recommended_tree.selection()
         if not selection:
-            messagebox.showwarning("Queue", "Please select a stream in the Recommended tab to queue.")
+            self._notify_warning("Queue", "Please select a stream in the Recommended tab to queue.")
             return
 
         item = self.recommended_tree.item(selection[0])
@@ -11809,7 +12216,7 @@ Total Streams: {len(self.current_formats)}"""
             # Direct combined stream
             format_id = video_info.split('(')[1].split(')')[0] if '(' in video_info else ''
             if not format_id:
-                messagebox.showerror("Queue", "Could not extract format ID from selection.")
+                self._notify_error("Queue", "Could not extract format ID from selection.")
                 return
             target_fmt = next((f for f in self.current_formats
                                if str(f.get('format_id', '')) == format_id), None)
@@ -11844,7 +12251,7 @@ Total Streams: {len(self.current_formats)}"""
                                if 'ID:' in audio_info
                                else (audio_info.split('(')[1].split(')')[0] if '(' in audio_info else ''))
             if not video_format_id or not audio_format_id:
-                messagebox.showerror("Queue", "Could not extract format IDs from selection.")
+                self._notify_error("Queue", "Could not extract format IDs from selection.")
                 return
             # Build output path (same logic as download_and_merge_combination)
             video_title    = vi_snap.get('title', 'video')
@@ -12309,7 +12716,7 @@ Total Streams: {len(self.current_formats)}"""
             toast.focus_set()
         except Exception:
             # Fallback to standard messagebox if Toplevel creation fails
-            messagebox.showerror(title, message)
+            self._notify_error(title, message)
 
     def _download_error(self, error_message):
         """Handle download error"""
@@ -12700,7 +13107,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         def copy_instructions():
             self.root.clipboard_clear()
             self.root.clipboard_append(detail_text)
-            messagebox.showinfo("Copied", "Instructions copied to clipboard!")
+            self._notify_info("Copied", "Instructions copied to clipboard!")
         
         ttk.Button(btn_frame, text="Copy Instructions", command=copy_instructions).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Close", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
@@ -14198,7 +14605,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
 
         try:
             res = subprocess.run(
-                [self.ytdlp_path, "--version"],
+                self._ytdlp_head() + ["--version"],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
                 creationflags=CREATE_NO_WINDOW)
             if res.returncode == 0:
@@ -14237,6 +14644,26 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         else:
             self.append_terminal_output(
                 "Custom DNS: INACTIVE (using system DNS)\n", "info")
+        # Make the yt-dlp stub impossible to miss: with --noconsole the
+        # startup print() goes nowhere, so an override that silently failed to
+        # apply looked exactly like one that worked.
+        try:
+            _ov = (os.environ.get('YSA_YTDLP_PATH') or '').strip().strip('"')
+            if _ov and os.path.normcase(os.path.abspath(_ov)) == \
+                    os.path.normcase(os.path.abspath(str(self.ytdlp_path or ''))):
+                self.append_terminal_output(
+                    "*** TEST STUB ACTIVE *** yt-dlp is overridden by "
+                    + _ov + "\n    mode: "
+                    + (os.environ.get('YSA_FAKE_MODE') or 'ok')
+                    + "   (unset YSA_YTDLP_PATH to use the real yt-dlp)\n",
+                    "warning")
+            elif _ov:
+                self.append_terminal_output(
+                    "YSA_YTDLP_PATH is set to '" + _ov + "' but was NOT used"
+                    " - the path does not exist. Using " + str(self.ytdlp_path)
+                    + "\n", "warning")
+        except Exception:
+            pass
         self.append_terminal_output(
             "Embed Metadata: " + ("ON" if self.embed_metadata_enabled.get() else "OFF") + "\n", "info")
         self.append_terminal_output(
@@ -14468,7 +14895,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             pass
         self.root.geometry("1000x1100")
         self._save_config_now()
-        messagebox.showinfo("Window", "Window size and position reset.")
+        self._notify_info("Window", "Window size and position reset.")
 
     def _cfg_get(self, cfg, key, current, cast=None):
         """Read ONE config key defensively; never let it poison the rest.
@@ -14715,10 +15142,24 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             except Exception:
                 pass
 
+    def _stub_active(self):
+        """True while downloads are fake (toolbar stub or a stubbed scenario)."""
+        try:
+            if getattr(self, 'stub_enabled', False):
+                return True
+            return 'ysa_fake_ytdlp' in str(getattr(self, 'ytdlp_path', '')).lower()
+        except Exception:
+            return False
+
     def _record_download(self, file_path, url, video_info, quality, download_time):
         # History recording can be switched off from the History tab. Read
         # the plain mirror, not the Tk variable - this runs on worker threads.
         if not getattr(self, '_m_history_on', getattr(self, 'history_enabled', True)):
+            return
+        # Stub downloads are not real videos - "Fake Test Video" repeated once
+        # per test is noise in a library history. Scenario runs against the
+        # REAL yt-dlp still record, because those downloads actually happened.
+        if self._stub_active():
             return
         """Record a completed download in the history list.
         Deduplicates by video_id (or URL fallback) - if the same video is
@@ -14777,7 +15218,10 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         # poll will pick up whatever is currently there.
         self._clipboard_last_seen = ''
         self._clipboard_watch_active = True
-        self.root.after(1000, self._clipboard_poll, self._clipboard_gen)
+        # 250 ms, not 1000: the clipboard is a single slot, so anything
+        # copied and replaced between two polls is never seen at all. Nine
+        # links clicked in a few seconds produced six downloads.
+        self.root.after(250, self._clipboard_poll, self._clipboard_gen)
 
     def _clipboard_poll(self, gen=0):
         """Single tick of the clipboard watch loop. Reschedules itself via root.after.
@@ -14794,7 +15238,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         # Don't fire while any modal dialog has grab focus (e.g. Settings)
         try:
             if self.root.grab_current() is not None:
-                self.root.after(1000, self._clipboard_poll, gen)
+                self.root.after(250, self._clipboard_poll, gen)
                 return
         except Exception:
             pass
@@ -14810,7 +15254,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 self.append_terminal_output(
                     'Clipboard: detected URL - ' + text[:60] + '\n', 'info')
                 self._enqueue_url_for_analysis(text)
-        self.root.after(1000, self._clipboard_poll, gen)
+        self.root.after(250, self._clipboard_poll, gen)
 
     # ── Queue persistence ──────────────────────────────────────────────────
 
@@ -15276,7 +15720,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             return None
         try:
             result = subprocess.run(
-                [self.ytdlp_path, '--version'],
+                self._ytdlp_head() + ['--version'],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
                 creationflags=CREATE_NO_WINDOW)
             if result.returncode == 0:
@@ -15293,7 +15737,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         self.append_terminal_output('Updating yt-dlp...\n', 'info')
         try:
             proc = subprocess.Popen(
-                [self.ytdlp_path, '-U'],
+                self._ytdlp_head() + ['-U'],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace', bufsize=1,
                 creationflags=CREATE_NO_WINDOW)
@@ -16281,7 +16725,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
 
             result = self.run_ytdlp_command(args, timeout=60)
             if result.returncode != 0 or not result.stdout.strip():
-                self.root.after(0, lambda: messagebox.showerror(
+                self.root.after(0, lambda: self._notify_error(
                     "Playlist Error", "Could not read playlist. Is the URL correct?"))
                 return
 
@@ -16295,7 +16739,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
 
             n = len(entries)
             if n == 0:
-                self.root.after(0, lambda: messagebox.showwarning(
+                self.root.after(0, lambda: self._notify_warning(
                     "Playlist", "No videos found in playlist."))
                 return
 
@@ -16341,7 +16785,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 # Mirror the batch-mode guard: with Auto-Download OFF there
                 # is no quality to queue at. Previously this line silently
                 # forced 1080p, ignoring the user's OFF state.
-                self.root.after(0, lambda: messagebox.showwarning(
+                self.root.after(0, lambda: self._notify_warning(
                     "Playlist",
                     "Auto-Download is disabled.\n"
                     "Enable it and select a quality so each video knows"
@@ -16444,7 +16888,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
 
         except Exception as e:
             err = str(e)
-            self.root.after(0, lambda m=err: messagebox.showerror("Playlist Error", m))
+            self.root.after(0, lambda m=err: self._notify_error("Playlist Error", m))
         finally:
             self.root.after(0, lambda: self.progress_bar.stop())
             self.root.after(0, lambda: self.progress_var.set("Ready"))

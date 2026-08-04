@@ -60,3 +60,29 @@ jobs:
         with:
           name: YSA-build
           path: dist/YSA
+
+      # --- Developer test stub -------------------------------------------
+      # Built separately and uploaded as its OWN artifact so it can never end
+      # up inside dist/YSA. A real .exe is required rather than the .py: the
+      # app spawns yt-dlp as a subprocess, so a .cmd shim needs cmd.exe
+      # (often blocked by policy) and a .py cannot be executed directly on
+      # Windows. Keeping it a real process also preserves pause/kill
+      # semantics, which the 416-salvage test depends on.
+      - name: Build fake yt-dlp stub
+        if: hashFiles('ysa_fake_ytdlp.py') != ''
+        run: |
+          pyinstaller --onefile --console `
+            --name "ysa_fake_ytdlp" ysa_fake_ytdlp.py
+
+      - name: Upload Dev Tools Artifact
+        if: hashFiles('ysa_fake_ytdlp.py') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: YSA-devtools
+          path: |
+            dist/ysa_fake_ytdlp.exe
+            ysa_devtest.py
+            ysa_scenarios.json
+            test_fixes.py
+            test_runner.py
+          if-no-files-found: warn
