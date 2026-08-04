@@ -464,6 +464,12 @@ _YT_TERMINAL_ERRORS = (
     'blocked it in your country',
     'video is unavailable in your country',
     'this video is unavailable',
+    # Not yet released. Every client returns the same answer, so the cascade
+    # is pure waste - observed as 7 attempts per analysis on a premiere.
+    'premieres in',
+    'this live event will begin in',
+    'this live stream will begin in',
+    'this video will be available',
 )
 
 _YT_AUDIO_AAC_IDS  = {'139', '140', '141', '256', '258', '327'}
@@ -3053,9 +3059,18 @@ class YouTubeStreamAnalyzerGUI:
 
             # Cookie copies left by a previous run (or a crash) are dead once
             # no yt-dlp is alive - reap them with the same guarded rule.
-            threading.Thread(
-                target=lambda: self._reap_cookie_copies(threshold=1),
-                daemon=True).start()
+            def _startup_sweep():
+                self._reap_cookie_copies(threshold=1)
+                _n = self._reap_ytdlp_meipass()
+                if _n:
+                    try:
+                        self.root.after(0, lambda: self.append_terminal_output(
+                            'Reclaimed ' + str(_n) + " abandoned yt-dlp temp"
+                            " folder(s) from the Windows temp directory.\n",
+                            'cache'))
+                    except Exception:
+                        pass
+            threading.Thread(target=_startup_sweep, daemon=True).start()
             
         except (PermissionError, OSError) as e:
             # Fallback - disable caching
@@ -4885,6 +4900,48 @@ class YouTubeStreamAnalyzerGUI:
             return _r.returncode == 0
         except Exception:
             return True
+
+    def _reap_ytdlp_meipass(self):
+        """Remove yt-dlp's abandoned PyInstaller extraction folders.
+
+        yt-dlp.exe is a onefile build: it unpacks itself to %TEMP%\\_MEInnnnn
+        on every run and removes it on exit - unless it crashes, which is
+        exactly what the 416/cookie failures cause. They accumulate at ~25 MB
+        each.
+
+        Deliberately narrow: _MEI folders belong to ANY PyInstaller onefile
+        program, so deleting one owned by another running application would
+        break it. Only folders containing yt-dlp's own marker are touched,
+        and only while no yt-dlp process is alive.
+        """
+        try:
+            base = tempfile.gettempdir()
+            if not os.path.isdir(base):
+                return 0
+            cand = []
+            for d in os.listdir(base):
+                if not d.startswith('_MEI'):
+                    continue
+                p = os.path.join(base, d)
+                if not os.path.isdir(p):
+                    continue
+                try:
+                    names = set(os.listdir(p))
+                except Exception:
+                    continue
+                # provably yt-dlp's: its embedded JS runtime package
+                if 'yt_dlp_ejs' in names or 'yt_dlp' in names:
+                    cand.append(p)
+            if not cand or self._any_ytdlp_running():
+                return 0
+            _n = 0
+            for p in cand:
+                shutil.rmtree(p, ignore_errors=True)
+                if not os.path.isdir(p):
+                    _n += 1
+            return _n
+        except Exception:
+            return 0
 
     def _reap_cookie_copies(self, threshold=25):
         """Remove throwaway cookie folders, but ONLY when nothing can be using them.
