@@ -7,16 +7,38 @@ import threading
 import webbrowser
 import re
 import subprocess
-import requests
-from requests.adapters import HTTPAdapter
+# requests costs ~110 ms of import time - a third of the app's total and
+# ~70% of the frozen exe's - paid before the window can begin, for a
+# library used only by thumbnails and the updater. Imported on first use.
+_http_session = None
+_http_session_lock = threading.Lock()
 
-# Module-level shared HTTP session with connection pooling and keep-alive.
-# Thread-safe for concurrent reads (requests.Session is thread-safe for
-# independent requests; it shares the connection pool but not state).
-_http_session = requests.Session()
-_http_adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=2)
-_http_session.mount('https://', _http_adapter)
-_http_session.mount('http://', _http_adapter)
+
+def _get_http_session():
+    """Shared HTTP session with connection pooling, built on first use.
+
+    Double-checked creation: thumbnail fetches arrive from several
+    precache workers at once, and two racing here must come away with
+    the SAME session. The session is published only after its adapters
+    are mounted, so an unlocked reader can never observe a half-built
+    one. Once built, requests.Session is thread-safe for independent
+    requests (shared connection pool, no shared per-request state).
+    """
+    global _http_session
+    s = _http_session
+    if s is None:
+        with _http_session_lock:
+            if _http_session is None:
+                import requests
+                from requests.adapters import HTTPAdapter
+                _s = requests.Session()
+                _adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8,
+                                       max_retries=2)
+                _s.mount('https://', _adapter)
+                _s.mount('http://', _adapter)
+                _http_session = _s
+            s = _http_session
+    return s
 import tempfile
 import shutil
 import time
@@ -1242,10 +1264,19 @@ class YouTubeStreamAnalyzerGUI:
         self.player_client = "default"       # yt-dlp player client for downloads
         self.prewarm_enabled = True          # Pre-warm next queued stream before download starts
         self.parallel_hardsub = False        # When True, queue continues while hardsub runs
+        self._hardsub_probe_lock = threading.Lock()  # hardsub encoder probe (batch 1a)
+        # 'libx264' (default) | 'auto'. Software WINS for burn-in on this
+        # class of machine: the subtitles filter is CPU-only, so hardware
+        # decode/encode adds a GPU->RAM->GPU round trip per frame. Measured
+        # on an Intel iGPU, same video, cached streams, power saving:
+        # 360p 4.3s software vs 12.4-13.7s QSV; 720p AV1 9.2s vs 18.2s.
+        # 'auto' stays available for a discrete GPU, where it may pay off.
+        self.hardsub_encoder = 'libx264'
         self.advance_queue_on_streams_done = False  # Advance queue as soon as streams cached, before post-processing
         self.precache_concurrent_count = 1   # Number of queue items to precache simultaneously
         self.batch_concurrent_fetches = 3    # Parallel info-fetch workers during batch analysis
-        self.clipboard_watch = False         # Auto-paste YouTube URLs detected in clipboard
+        self.clipboard_watch = False
+        self.clear_cache_on_exit = False   # wipe every cache folder at exit         # Auto-paste YouTube URLs detected in clipboard
         self.batch_start_immediately = True  # Start downloading immediately when batch runs
         self.terminal_expanded = True        # Terminal visible on startup
         self.custom_dns = True               # Use Google DNS proxy by default
@@ -1305,6 +1336,13 @@ class YouTubeStreamAnalyzerGUI:
         # separate config and cache without touching the real ones.
         self.config_filename = 'ysa_config.json'
         self.cache_dirname   = 'ysa_cache' 
+        self.state_dirname   = 'ysa_state'  # logs + yt-dlp cache: survives cache clears
+        # Clear Cache Now is scorched earth by design; these say what it
+        # spares. Logs default to PRESERVED - they are the flight recorder
+        # this project debugs from. Clear-on-EXIT ignores all three.
+        self.preserve_logs_on_clear    = True
+        self.preserve_ytdlp_on_clear   = False
+        self.preserve_history_on_clear = False
         # ── Interface ────────────────────────────────────────────────────
         self.history_enabled  = True    # record finished downloads in History
         self.remember_window  = True    # restore window size/position
@@ -1317,6 +1355,7 @@ class YouTubeStreamAnalyzerGUI:
         self.stub_fail_times = 0         # dev tools: fail N times, then succeed
         self._real_ytdlp_path = None     # remembered so the stub can be undone
         self._real_cache_dirname = None  # ditto for the cache + output folder
+        self._real_state_dirname = None  # ditto for the state folder (logs + yt-dlp)
         self._real_download_path = None
 
         # Load persistent configuration (overrides defaults above)
@@ -1942,6 +1981,11 @@ class YouTubeStreamAnalyzerGUI:
                 base, 'YSA_' + time.strftime('%Y%m%d_%H%M%S') + '.log')
             self._session_log_fh = open(self._session_log_path, 'a',
                                         encoding='utf-8', errors='replace')
+            # Clock for the per-line elapsed prefix written by
+            # _write_session_log. Anchored at log open, so every log
+            # file starts at 0.000 and is read without arithmetic.
+            self._session_log_t0 = time.monotonic()
+            self._log_at_line_start = True
             logs = sorted(f for f in os.listdir(base) if f.endswith('.log'))
             for _stale in logs[:-30]:
                 try:
@@ -1952,12 +1996,47 @@ class YouTubeStreamAnalyzerGUI:
             self._session_log_fh = None
 
     def _write_session_log(self, text):
-        """Append one terminal chunk to the session log (best-effort)."""
+        """Append one terminal chunk to the session log (best-effort).
+
+        Each line is prefixed with seconds elapsed since the log was
+        opened, so a log is self-profiling: the gap between the info
+        fetch, the JS challenge, the transfer and the FFmpeg merge is
+        readable directly instead of inferred from a total.
+
+        Prefix goes on the LOG ONLY - the terminal widget and the
+        _output_listeners fan-out both receive the unmodified text.
+
+        Chunks are not guaranteed to be whole lines, so a line-start
+        flag carries across calls; a chunk arriving mid-line is not
+        prefixed. Blank lines stay blank. Single-threaded: the only
+        caller is append_terminal_output, past its main-thread guard.
+        """
         fh = getattr(self, '_session_log_fh', None)
         if fh is None:
             return
         try:
-            fh.write(text)
+            t0 = getattr(self, '_session_log_t0', None)
+            if t0 is None:
+                t0 = time.monotonic()
+                self._session_log_t0 = t0
+            prefix = '[' + ('%9.3f' % (time.monotonic() - t0)) + '] '
+
+            at_start = getattr(self, '_log_at_line_start', True)
+            parts = text.split('\n')
+            last = len(parts) - 1
+            buf = []
+            for i, part in enumerate(parts):
+                if part:
+                    if at_start:
+                        buf.append(prefix)
+                        at_start = False
+                    buf.append(part)
+                if i != last:
+                    buf.append('\n')
+                    at_start = True
+            self._log_at_line_start = at_start
+
+            fh.write(''.join(buf))
             fh.flush()
         except Exception:
             # Disk full / folder removed mid-session: disable quietly.
@@ -3006,12 +3085,22 @@ class YouTubeStreamAnalyzerGUI:
                 SCRIPT_DIR, getattr(self, "cache_dirname", "ysa_cache"))
             os.makedirs(self.ysa_cache_root, exist_ok=True)
 
+            # ── State root: survives routine cache clears BY LOCATION ──
+            # Session logs and the yt-dlp player/nsig cache are
+            # operational state, not cache: clear-cache-on-exit used to
+            # wipe both, costing diagnostics and forcing the player-JS
+            # re-solve on the first video of every session. Survival is
+            # structural now - the delete paths need no new logic.
+            self.ysa_state_root = os.path.join(
+                SCRIPT_DIR, getattr(self, "state_dirname", "ysa_state"))
+            os.makedirs(self.ysa_state_root, exist_ok=True)
+
             # Single home for ALL temporary operations
             self.ysa_tmp_dir = os.path.join(self.ysa_cache_root, "tmp")
             os.makedirs(self.ysa_tmp_dir, exist_ok=True)
 
             # Session logs (terminal output mirrored to disk)
-            self.ysa_logs_dir = os.path.join(self.ysa_cache_root, "logs")
+            self.ysa_logs_dir = os.path.join(self.ysa_state_root, "logs")
             os.makedirs(self.ysa_logs_dir, exist_ok=True)
 
             # One-time migration: the old %TEMP% cache is rebuildable stream
@@ -3047,7 +3136,7 @@ class YouTubeStreamAnalyzerGUI:
             os.makedirs(self.mp3_cache_dir, exist_ok=True)
 
             # yt-dlp cache directory
-            self.yt_dlp_cache_dir = os.path.join(self.ysa_cache_root, "yt-dlp")
+            self.yt_dlp_cache_dir = os.path.join(self.ysa_state_root, "yt-dlp")
             os.makedirs(self.yt_dlp_cache_dir, exist_ok=True)
             
             # Cache metadata file
@@ -3075,6 +3164,7 @@ class YouTubeStreamAnalyzerGUI:
         except (PermissionError, OSError) as e:
             # Fallback - disable caching
             self.ysa_cache_root = None
+            self.ysa_state_root = None
             self.ysa_tmp_dir = None
             self.ysa_logs_dir = None
             self.video_cache_dir = None
@@ -3181,7 +3271,18 @@ class YouTubeStreamAnalyzerGUI:
 
         Runs on a background thread, so the running total is accumulated
         locally and applied once under _cache_lock - "+=" on a shared int is
-        not atomic, and downloads writing to the cache can overlap this."""
+        not atomic, and downloads writing to the cache can overlap this.
+
+        The root is captured up front and re-checked before the total is
+        applied: setup_cache_directories can REPOINT ysa_cache_root while
+        this thread is still walking (the dev stub swaps in ysa_cache_dev),
+        and the total would then land on a counter that now means a
+        different folder. A scenario run caught exactly that - 1585 MB
+        counted against an empty sandbox. A stale total is discarded
+        rather than corrected: the new root reloads its own metadata, so
+        the only cost is that its orphan files go uncounted until the
+        next scan."""
+        _root_at_start = getattr(self, 'ysa_cache_root', None)
         _orphan_total = 0
         try:
             if self.subtitle_cache_dir and os.path.isdir(self.subtitle_cache_dir):
@@ -3260,6 +3361,10 @@ class YouTubeStreamAnalyzerGUI:
             # Size bookkeeping only - never touch cache_metadata here.
             print("Warning: orphan cache size scan failed: " + str(e))
     
+        if getattr(self, 'ysa_cache_root', None) != _root_at_start:
+            # The cache root moved under this scan - the total belongs to
+            # a folder this counter no longer describes.
+            return
         try:
             with self._cache_lock:
                 self._cache_size_bytes += _orphan_total
@@ -3493,6 +3598,16 @@ class YouTubeStreamAnalyzerGUI:
                 self._cache_size_bytes = 0
 
                 print("Cache cleanup complete.")
+
+            # Runs last and unconditionally when enabled: the per-category
+            # cleanup above is skipped entirely when "keep cache between
+            # sessions" is on, and this setting deliberately overrides it.
+            # Safe here because the session log handle is already closed.
+            if getattr(self, 'clear_cache_on_exit', False):
+                _rm, _left = self._delete_all_cache_folders()
+                print("Clear-on-exit removed: "
+                      + (", ".join(_rm) if _rm else "nothing")
+                      + (" (some files were locked)" if _left else ""))
         except Exception as e:
             print("Warning: Cache cleanup failed: " + str(e))
 
@@ -3831,7 +3946,7 @@ class YouTubeStreamAnalyzerGUI:
                         best_url = _best['url']
             except Exception:
                 pass
-            r = _http_session.get(best_url, timeout=15)
+            r = _get_http_session().get(best_url, timeout=15)
             r.raise_for_status()
             tmp_path = cache_path + '.tmp'
             with open(tmp_path, 'wb') as tf:
@@ -4100,10 +4215,14 @@ class YouTubeStreamAnalyzerGUI:
                 if self._real_cache_dirname is None:
                     self._real_cache_dirname = getattr(self, 'cache_dirname',
                                                        'ysa_cache')
+                    self._real_state_dirname = getattr(self, 'state_dirname',
+                                                       'ysa_state')
                     self._real_download_path = self.download_path
-                # Share the dev sandbox rather than a third folder: same
-                # cache, same session logs, one place to look.
+                # Dev sandbox mirrors the real split: ysa_cache_dev for
+                # cache, ysa_state_dev for logs + the yt-dlp cache - the
+                # stub can never touch either real folder.
                 self.cache_dirname = 'ysa_cache_dev'
+                self.state_dirname = 'ysa_state_dev'
                 self.setup_cache_directories()
                 try:
                     _so = os.path.join(SCRIPT_DIR, 'selftest_output')
@@ -4122,6 +4241,9 @@ class YouTubeStreamAnalyzerGUI:
                 # put the real cache and download folder back
                 if self._real_cache_dirname is not None:
                     self.cache_dirname = self._real_cache_dirname
+                    if self._real_state_dirname is not None:
+                        self.state_dirname = self._real_state_dirname
+                        self._real_state_dirname = None
                     self.setup_cache_directories()
                     if self._real_download_path:
                         self.download_path = self._real_download_path
@@ -4994,6 +5116,32 @@ class YouTubeStreamAnalyzerGUI:
             except Exception:
                 pass
 
+    def _warn_pot_combo_once(self, combo_active):
+        """One LOUD warning per episode of cookies-without-PoT.
+
+        Sending logged-in cookies while no PO-token server answers is
+        the traffic signature that gets ACCOUNTS flagged (SABR-only /
+        360p): fully identifiable requests wearing the automation-shaped
+        token-less fallback. It cost this project's account once.
+
+        Fires on the first fetch of each such episode; any fetch that
+        sees the combo absent (server up, or cookies off) re-arms it,
+        so a server dying mid-session warns again exactly once.
+        Concurrent analysis workers can race the flag - worst case the
+        warning prints twice, never once per fetch (same trade as the
+        cookie staleness gate).
+        """
+        if combo_active:
+            if not getattr(self, '_pot_combo_warned', False):
+                self._pot_combo_warned = True
+                self.root.after(0, lambda: self.append_terminal_output(
+                    'RISK: cookies are being sent WITHOUT the bgutil PO-token server.\n'
+                    '      Logged-in + token-less is the pattern that gets accounts\n'
+                    '      flagged (SABR / 360p-only). Start the server in Settings >\n'
+                    '      bgutil, or turn Cookies off in the toolbar.\n', 'warning'))
+        else:
+            self._pot_combo_warned = False
+
     def get_ytdlp_cookies_args(self):
         """Return cookie args for yt-dlp.
 
@@ -5015,8 +5163,17 @@ class YouTubeStreamAnalyzerGUI:
         if cookie_file:
             if os.path.isfile(cookie_file):
                 try:
-                    age_days = (time.time() - os.path.getmtime(cookie_file)) / 86400
-                    if age_days > 7:
+                    _ck_mtime = os.path.getmtime(cookie_file)
+                    age_days = (time.time() - _ck_mtime) / 86400
+                    # Warn once per cookie-file VERSION, not per invocation:
+                    # a queued session builds this arg list dozens of times
+                    # and the repeated warning drowned the log. Re-exporting
+                    # the file (new mtime) re-arms the warning. Workers can
+                    # race here; the worst case is the warning printing
+                    # twice instead of once, so no lock is taken.
+                    if age_days > 7 and _ck_mtime != getattr(
+                            self, '_ck_stale_warned_mtime', None):
+                        self._ck_stale_warned_mtime = _ck_mtime
                         self.root.after(0, lambda d=int(age_days): self.append_terminal_output(
                             'Warning: cookies.txt is ' + str(d) + ' days old - '
                             'consider re-exporting from a fresh incognito session.\n', 'warning'))
@@ -5225,6 +5382,7 @@ class YouTubeStreamAnalyzerGUI:
             self.root.after(0, lambda: self.append_terminal_output(
                 'bgutil: PO token provider ACTIVE' +
                 (' - extended cascade ON.' if _use_cascade else ' - single attempt.') + '\n', 'success'))
+            self._warn_pot_combo_once(False)
             if _use_cascade:
                 # Multiple clients: default web (PO token via bgutil) + no-PO-token clients as fallback
                 attempts = [
@@ -5248,6 +5406,7 @@ class YouTubeStreamAnalyzerGUI:
             self.root.after(0, lambda: self.append_terminal_output(
                 'bgutil: not running - ' +
                 ('extended client cascade.' if _use_cascade else 'single attempt (cascade OFF).') + '\n', 'info'))
+            self._warn_pot_combo_once(bool(_ck))
             # Each entry: (label, extra_args, with_cookies)
             # Clients not requiring a GVS PO token per the yt-dlp PO Token
             # Guide (verified 2026-06 against yt-dlp 2026.06.09):
@@ -6097,6 +6256,157 @@ class YouTubeStreamAnalyzerGUI:
             self.root.after(100, self._apply_terminal_collapsed)
 
     
+    def _state_subdir_targets(self, leaf):
+        """Both state roots' copies of one subfolder (real + dev sandbox).
+
+        Named explicitly rather than derived from ysa_state_root because
+        with the stub engaged that attribute points at ysa_state_dev -
+        the same trap _delete_all_cache_folders documents for the cache.
+        """
+        return [os.path.join(SCRIPT_DIR, _n, leaf)
+                for _n in ('ysa_state', 'ysa_state_dev')]
+
+    def _delete_ytdlp_cache_folders(self):
+        """Remove the yt-dlp player/nsig cache wholesale. Returns
+        (removed_names, anything_left_behind). Shared by the dedicated
+        Clear yt-dlp Cache button and by Clear Cache Now, so the two
+        cannot drift apart."""
+        _targets = self._state_subdir_targets('yt-dlp')
+        _removed = []
+        for _t in _targets:
+            if os.path.isdir(_t):
+                shutil.rmtree(_t, ignore_errors=True)
+                if not os.path.isdir(_t):
+                    _removed.append(os.path.basename(os.path.dirname(_t))
+                                    + '/yt-dlp')
+        return _removed, any(os.path.isdir(_t) for _t in _targets)
+
+    def _delete_state_and_history_on_clear(self):
+        """The non-cache leftovers Clear Cache Now also removes.
+
+        Scorched earth minus whatever the Settings > Cache 'Preserve'
+        boxes protect. Every target is removed WHOLESALE - a whole
+        folder, or the whole history file - never a per-file walk with a
+        counter, which is the shape that once early-returned and left
+        categories behind (see clear_video_cache's docstring).
+
+        Clear-cache-on-EXIT never calls this: on-exit stays hardwired to
+        the cache roots, so a stray checkbox can never cost a log.
+        """
+        _removed, _left = [], False
+        if not getattr(self, 'preserve_logs_on_clear', True):
+            _targets = self._state_subdir_targets('logs')
+            for _t in _targets:
+                if os.path.isdir(_t):
+                    shutil.rmtree(_t, ignore_errors=True)
+                    if not os.path.isdir(_t):
+                        _removed.append(os.path.basename(os.path.dirname(_t))
+                                        + '/logs')
+            _left = _left or any(os.path.isdir(_t) for _t in _targets)
+        if not getattr(self, 'preserve_ytdlp_on_clear', False):
+            _r, _l = self._delete_ytdlp_cache_folders()
+            _removed += _r
+            _left = _left or _l
+        if not getattr(self, 'preserve_history_on_clear', False):
+            # Clear the in-memory list FIRST: deleting only the file would
+            # be undone by the next _save_download_history().
+            try:
+                self.download_history.clear()
+            except Exception:
+                pass
+            _h = os.path.join(SCRIPT_DIR, 'ysa_history.json')
+            if os.path.isfile(_h):
+                try:
+                    os.remove(_h)
+                    _removed.append('ysa_history.json')
+                except OSError:
+                    _left = True
+            try:
+                self._refresh_history_panel()
+            except Exception:
+                pass
+        # The roots go too when nothing inside them was preserved: 'clear the
+        # cache should leave nothing on disk, not an empty shell'
+        # (clear_video_cache's own rule, applied to state as well). os.rmdir
+        # REFUSES a non-empty directory, so a preserved logs or yt-dlp folder
+        # blocks this by itself - no second condition to keep in sync, and
+        # nothing unexpected can ever be swept up with the root.
+        for _n in ('ysa_state', 'ysa_state_dev'):
+            _r = os.path.join(SCRIPT_DIR, _n)
+            if os.path.isdir(_r):
+                try:
+                    os.rmdir(_r)
+                    _removed.append(_n)
+                except OSError:
+                    pass
+        return _removed, _left
+
+    def clear_ytdlp_cache(self):
+        """Delete ONLY the yt-dlp player/nsig cache.
+
+        That cache occasionally goes stale and clearing it fixes
+        extraction errors, so the action exists deliberately instead of
+        riding along as a side effect of Clear Cache.
+        """
+        if not messagebox.askyesno(
+                'Clear yt-dlp Cache',
+                'Delete the yt-dlp player / nsig cache?\n\n'
+                'Cached streams, logs and history are NOT touched.\n'
+                'The next video will re-solve the player JS once.'):
+            return
+        _removed, _left = self._delete_ytdlp_cache_folders()
+        if _removed:
+            self.append_terminal_output(
+                'Cleared yt-dlp cache: ' + ', '.join(_removed) + '\n', 'success')
+        else:
+            self.append_terminal_output(
+                'yt-dlp cache: nothing to remove.\n', 'info')
+        if _left:
+            self.append_terminal_output(
+                'Some yt-dlp cache files were locked and remain.\n', 'warning')
+
+    def _delete_all_cache_folders(self):
+        """Remove every cache folder: the active one plus the real and dev
+        sandboxes. Returns (removed_names, anything_left_behind).
+
+        Shared by the Clear Cache button and the clear-on-exit setting so the
+        two cannot drift apart - "the same as the button" has to mean the
+        same code, not a copy of it. With the stub or a scenario run engaged
+        ysa_cache_root points at ysa_cache_dev, so naming the real cache
+        explicitly is what stops it being skipped.
+        """
+        _targets, _seen = [], set()
+        for _t in ([getattr(self, 'ysa_cache_root', None)]
+                   + [os.path.join(SCRIPT_DIR, _n) for _n in
+                      ('ysa_cache', 'ysa_cache_dev', 'ysa_cache_stub')]):
+            if not _t:
+                continue
+            _k = os.path.normcase(os.path.abspath(_t))
+            if _k in _seen:
+                continue
+            _seen.add(_k)
+            _targets.append(_t)
+        _removed = []
+        for _t in _targets:
+            if os.path.isdir(_t):
+                shutil.rmtree(_t, ignore_errors=True)
+                if not os.path.isdir(_t):
+                    _removed.append(os.path.basename(_t.rstrip('\\/')))
+        return _removed, any(os.path.isdir(_t) for _t in _targets)
+
+    def _preserve_summary_text(self):
+        """One human line each for what Clear Cache also deletes and what
+        it spares, so the confirm dialog can never misdescribe it."""
+        _also, _kept = [], []
+        (_kept if getattr(self, 'preserve_logs_on_clear', True)
+         else _also).append('session logs')
+        (_kept if getattr(self, 'preserve_ytdlp_on_clear', False)
+         else _also).append('yt-dlp cache')
+        (_kept if getattr(self, 'preserve_history_on_clear', False)
+         else _also).append('download history')
+        _t = 'Also deleted: ' + (', '.join(_also) if _also else 'nothing else')
+        return _t + '\nPreserved: ' + (', '.join(_kept) if _kept else 'nothing')
+
     def clear_video_cache(self):
         """Clear Cache = nuke the entire ysa_cache folder and start fresh.
 
@@ -6135,7 +6445,8 @@ class YouTubeStreamAnalyzerGUI:
                     + self.ysa_cache_root + "\n\n"
                     + "All cached streams, premuxed files, subtitles,"
                     " thumbnails, MP3s and temp files will be removed."
-                    " Future downloads will re-fetch streams as needed."):
+                    " Future downloads will re-fetch streams as needed.\n\n"
+                    + self._preserve_summary_text()):
                 return
 
             # Release anything that may hold files inside the folder
@@ -6163,24 +6474,13 @@ class YouTubeStreamAnalyzerGUI:
             # real cache untouched while reporting "Cache folder deleted".
             # ysa_cache_stub is the pre-merge stub folder; still removed so an
             # upgraded install does not keep it forever.
-            _targets, _seen = [], set()
-            for _t in ([self.ysa_cache_root]
-                       + [os.path.join(SCRIPT_DIR, _n) for _n in
-                          ('ysa_cache', 'ysa_cache_dev', 'ysa_cache_stub')]):
-                if not _t:
-                    continue
-                _k = os.path.normcase(os.path.abspath(_t))
-                if _k in _seen:
-                    continue
-                _seen.add(_k)
-                _targets.append(_t)
-            _removed = []
-            for _t in _targets:
-                if os.path.isdir(_t):
-                    shutil.rmtree(_t, ignore_errors=True)
-                    if not os.path.isdir(_t):
-                        _removed.append(os.path.basename(_t.rstrip('\\/')))
-            _leftover = any(os.path.isdir(_t) for _t in _targets)
+            _removed, _leftover = self._delete_all_cache_folders()
+            # Scorched earth continues past the cache roots: state folders
+            # and history, minus whatever the Preserve boxes protect. The
+            # on-exit path deliberately does NOT call this.
+            _extra, _extra_left = self._delete_state_and_history_on_clear()
+            _removed = _removed + _extra
+            _leftover = _leftover or _extra_left
 
             # The folder is deliberately NOT recreated here: "clear the cache"
             # should leave nothing on disk, not an empty shell. The structure
@@ -7971,6 +8271,7 @@ Total Streams: {len(self.current_formats)}"""
 
         def _fetch_ytdlp_status():
             local_v = self._get_ytdlp_version()
+            import requests  # deferred - see _get_http_session at module top
             try:
                 resp = requests.get(
                     'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest',
@@ -8502,8 +8803,22 @@ Total Streams: {len(self.current_formats)}"""
 
         ttk.Label(tab_dl, text="Player Client:").grid(
             row=23, column=0, sticky=tk.W, padx=8, pady=(2, 0))
+        # Client list refreshed against the yt-dlp README (2026-07).
+        # Ordered by cost: the no-PO-token clients first, the ones
+        # that need a running bgutil server last.
+        #   android_vr / visionos - no PO token, no JS challenge
+        #   tv_downgraded         - what cookies force by default
+        #   android / ios         - REQUIRE a GVS PO token (bgutil)
+        # android_sdkless was removed from yt-dlp in Jan 2026.
         _client_opts = [
             "default",
+            "android_vr",
+            "android_vr,default",
+            "visionos",
+            "visionos,android_vr",
+            "tv",
+            "tv_downgraded",
+            "web_embedded",
             "android",
             "ios",
             "android,default",
@@ -8512,9 +8827,12 @@ Total Streams: {len(self.current_formats)}"""
         client_var = tk.StringVar(value=self.player_client)
         client_combo = ttk.Combobox(tab_dl, textvariable=client_var,
                                     values=_client_opts, state='readonly', width=22)
-        client_combo.grid(row=23, column=1, columnspan=2, sticky=tk.W, padx=8, pady=(2, 0))
+        client_combo.grid(row=23, column=1, sticky=tk.W, padx=8, pady=(2, 0))
+        ttk.Button(tab_dl, text="?", width=2,
+                   command=self._show_player_client_help).grid(
+            row=23, column=2, sticky=tk.W, padx=(2, 8), pady=(2, 0))
         ttk.Label(tab_dl,
-                  text="default = most compatible. android/ios = less throttled on some networks.",
+                  text="Affects downloads, not analysis. Press ? for what each client costs.",
                   font=('Arial', 8), foreground='gray').grid(
             row=24, column=0, columnspan=3, sticky=tk.W, padx=24, pady=(0, 6))
 
@@ -8663,6 +8981,22 @@ Total Streams: {len(self.current_formats)}"""
                   font=('Arial', 8), foreground='gray').grid(
             row=42, column=0, columnspan=3, sticky=tk.W, padx=24, pady=(0, 6))
 
+        ttk.Label(tab_dl, text="Hardsub encoder:").grid(
+            row=43, column=0, sticky=tk.W, padx=8, pady=(2, 0))
+        hardsub_enc_var = tk.StringVar(value=getattr(self, 'hardsub_encoder', 'libx264'))
+        ttk.Combobox(tab_dl, textvariable=hardsub_enc_var,
+                     values=('auto', 'libx264'), state='readonly', width=20).grid(
+            row=43, column=1, sticky=tk.W, padx=8, pady=(2, 0))
+        ttk.Label(tab_dl,
+                  text="'libx264' (default) encodes in software - measured 2-3x\n"
+                       "FASTER than hardware here, because the subtitle filter is\n"
+                       "CPU-only and forces a GPU round trip per frame.\n"
+                       "'auto' probes NVENC / QSV / AMF and uses the first that\n"
+                       "works - worth trying on a discrete GPU. Hardware failures\n"
+                       "self-demote to libx264 for the session.",
+                  font=('Arial', 8), foreground='gray').grid(
+            row=44, column=0, columnspan=3, sticky=tk.W, padx=24, pady=(0, 6))
+
         # ── Tab 3: Cache ───────────────────────────────────────────────────
         tab_cache = ttk.Frame(notebook)
         tab_cache.columnconfigure(1, weight=1)
@@ -8729,15 +9063,49 @@ Total Streams: {len(self.current_formats)}"""
                   font=('Arial', 8), foreground="gray").grid(
             row=5, column=0, columnspan=3, sticky=tk.W, padx=24)
 
+        cce_var = tk.BooleanVar(value=self.clear_cache_on_exit)
+        cce_cb = ttk.Checkbutton(tab_cache,
+                                 text="Delete ALL cache folders when the app closes",
+                                 variable=cce_var)
+        cce_cb.grid(row=6, column=0, columnspan=3, sticky=tk.W, padx=8, pady=4)
+
+        def _sync_cache_exclusive():
+            """The two are opposites: keeping the cache and wiping it on exit
+            cannot both apply. Grey out whichever the other rules out.
+
+            Both OFF is still valid - that is the default, where only the
+            stream folders are cleared and the yt-dlp cache is kept.
+            """
+            try:
+                cce_cb.config(state='disabled' if pc_var.get() else 'normal')
+                pc_cb.config(state='disabled' if cce_var.get() else 'normal')
+            except Exception:
+                pass
+        # A config edited by hand could set both; the explicit destructive
+        # instruction wins, otherwise BOTH would grey out and neither could
+        # be changed again.
+        if pc_var.get() and cce_var.get():
+            pc_var.set(False)
+        pc_cb.config(command=_sync_cache_exclusive)
+        cce_cb.config(command=_sync_cache_exclusive)
+        _sync_cache_exclusive()
+        ttk.Label(tab_cache,
+                  text="(Same as the Clear Cache button: removes ysa_cache and"
+                       " the developer sandboxes. Overrides 'Keep cache"
+                       " between sessions'.)",
+                  font=('Arial', 8), foreground="gray", wraplength=520,
+                  justify=tk.LEFT).grid(
+            row=7, column=0, columnspan=3, sticky=tk.W, padx=24)
+
         def clear_cache_now():
             self.clear_video_cache()
             dialog.after(200, _refresh_cache_size)
 
         ttk.Button(tab_cache, text="Clear Cache Now", command=clear_cache_now).grid(
-            row=6, column=0, sticky=tk.W, padx=8, pady=8)
+            row=8, column=0, sticky=tk.W, padx=8, pady=8)
 
         ttk.Separator(tab_cache, orient=tk.HORIZONTAL).grid(
-            row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), padx=8, pady=4)
+            row=9, column=0, columnspan=3, sticky=(tk.W, tk.E), padx=8, pady=4)
 
         def _open_folder(path):
             """Open a folder in Windows Explorer (or file manager on other OS)."""
@@ -8756,31 +9124,64 @@ Total Streams: {len(self.current_formats)}"""
                 self._notify_error("Open Folder", "Could not open folder:\n" + str(e))
 
         ttk.Label(tab_cache, text="Video Cache Path:", font=('Arial', 8)).grid(
-            row=8, column=0, sticky=tk.W, padx=8, pady=2)
-        ttk.Label(tab_cache, text=self.video_cache_dir or "Disabled",
-                  foreground="gray", font=('Arial', 8)).grid(
-            row=8, column=1, sticky=tk.W, padx=8, pady=2)
-        ttk.Button(tab_cache, text="Open Folder",
-                   command=lambda: _open_folder(self.video_cache_dir)).grid(
-            row=8, column=2, sticky=tk.W, padx=4, pady=2)
-
-        ttk.Label(tab_cache, text="Audio Cache Path:", font=('Arial', 8)).grid(
-            row=9, column=0, sticky=tk.W, padx=8, pady=2)
-        ttk.Label(tab_cache, text=self.audio_cache_dir or "Disabled",
-                  foreground="gray", font=('Arial', 8)).grid(
-            row=9, column=1, sticky=tk.W, padx=8, pady=2)
-        ttk.Button(tab_cache, text="Open Folder",
-                   command=lambda: _open_folder(self.audio_cache_dir)).grid(
-            row=9, column=2, sticky=tk.W, padx=4, pady=2)
-
-        ttk.Label(tab_cache, text="yt-dlp Cache Path:", font=('Arial', 8)).grid(
             row=10, column=0, sticky=tk.W, padx=8, pady=2)
-        ttk.Label(tab_cache, text=self.yt_dlp_cache_dir or "Disabled",
+        ttk.Label(tab_cache, text=self.video_cache_dir or "Disabled",
                   foreground="gray", font=('Arial', 8)).grid(
             row=10, column=1, sticky=tk.W, padx=8, pady=2)
         ttk.Button(tab_cache, text="Open Folder",
-                   command=lambda: _open_folder(self.yt_dlp_cache_dir)).grid(
+                   command=lambda: _open_folder(self.video_cache_dir)).grid(
             row=10, column=2, sticky=tk.W, padx=4, pady=2)
+
+        ttk.Label(tab_cache, text="Audio Cache Path:", font=('Arial', 8)).grid(
+            row=11, column=0, sticky=tk.W, padx=8, pady=2)
+        ttk.Label(tab_cache, text=self.audio_cache_dir or "Disabled",
+                  foreground="gray", font=('Arial', 8)).grid(
+            row=11, column=1, sticky=tk.W, padx=8, pady=2)
+        ttk.Button(tab_cache, text="Open Folder",
+                   command=lambda: _open_folder(self.audio_cache_dir)).grid(
+            row=11, column=2, sticky=tk.W, padx=4, pady=2)
+
+        ttk.Label(tab_cache, text="yt-dlp Cache Path:", font=('Arial', 8)).grid(
+            row=12, column=0, sticky=tk.W, padx=8, pady=2)
+        ttk.Label(tab_cache, text=self.yt_dlp_cache_dir or "Disabled",
+                  foreground="gray", font=('Arial', 8)).grid(
+            row=12, column=1, sticky=tk.W, padx=8, pady=2)
+        ttk.Button(tab_cache, text="Open Folder",
+                   command=lambda: _open_folder(self.yt_dlp_cache_dir)).grid(
+            row=12, column=2, sticky=tk.W, padx=4, pady=2)
+
+        ttk.Separator(tab_cache, orient=tk.HORIZONTAL).grid(
+            row=13, column=0, columnspan=3, sticky=(tk.W, tk.E), padx=8, pady=(8, 4))
+
+        ttk.Label(tab_cache,
+                  text="Preserve when Clear Cache Now is pressed:").grid(
+            row=14, column=0, columnspan=3, sticky=tk.W, padx=8, pady=(2, 0))
+        preserve_logs_var = tk.BooleanVar(value=getattr(self, 'preserve_logs_on_clear', True))
+        preserve_ytdlp_var = tk.BooleanVar(value=getattr(self, 'preserve_ytdlp_on_clear', False))
+        preserve_hist_var = tk.BooleanVar(value=getattr(self, 'preserve_history_on_clear', False))
+        _pres_frame = ttk.Frame(tab_cache)
+        _pres_frame.grid(row=15, column=0, columnspan=3, sticky=tk.W, padx=24, pady=(2, 0))
+        ttk.Checkbutton(_pres_frame, text="Session logs",
+                        variable=preserve_logs_var).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(_pres_frame, text="yt-dlp cache",
+                        variable=preserve_ytdlp_var).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(_pres_frame, text="Download history",
+                        variable=preserve_hist_var).pack(side=tk.LEFT)
+        ttk.Label(tab_cache,
+                  text="Clear Cache Now deletes the cache folders, the state folders\n"
+                       "and the download history. Ticked items survive it.\n"
+                       "Clearing the cache on EXIT only ever touches ysa_cache -\n"
+                       "it ignores these boxes entirely.",
+                  font=('Arial', 8), foreground='gray').grid(
+            row=16, column=0, columnspan=3, sticky=tk.W, padx=24, pady=(0, 6))
+
+        _ytc_frame = ttk.Frame(tab_cache)
+        _ytc_frame.grid(row=17, column=0, columnspan=3, sticky=tk.W, padx=8, pady=(2, 10))
+        ttk.Button(_ytc_frame, text="Clear yt-dlp Cache",
+                   command=self.clear_ytdlp_cache).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(_ytc_frame,
+                  text="Fixes stale-extractor errors. Streams, logs and history untouched.",
+                  font=('Arial', 8), foreground='gray').pack(side=tk.LEFT)
 
         # ── Tab 4: bgutil PO Token Provider ────────────────────────────────
         tab_bgutil = ttk.Frame(notebook)
@@ -9381,11 +9782,20 @@ Total Streams: {len(self.current_formats)}"""
             except ValueError:
                 self.max_cache_mb = 0
             self.persistent_cache_var.set(pc_var.get())
+            self.clear_cache_on_exit = cce_var.get()
+            self.preserve_logs_on_clear = preserve_logs_var.get()
+            self.preserve_ytdlp_on_clear = preserve_ytdlp_var.get()
+            self.preserve_history_on_clear = preserve_hist_var.get()
             self.auto_update_tools = auto_upd_var.get()
 
             self.player_client = client_var.get()
             self.prewarm_enabled = prewarm_var.get()
             self.parallel_hardsub = parallel_hardsub_var.get()
+            self.hardsub_encoder = hardsub_enc_var.get()
+            if self.hardsub_encoder == 'auto':
+                # Re-probe on the next burn so switching back to auto after
+                # a mid-session demote can rediscover the hardware.
+                self._hardsub_encoder = None
             try:
                 self.precache_concurrent_count = max(1, min(5, int(precache_count_var.get())))
             except ValueError:
@@ -9439,6 +9849,47 @@ Total Streams: {len(self.current_formats)}"""
         # Pressing Enter anywhere in the settings dialog triggers Save,
         # matching the behaviour users expect from a standard dialog.
         dialog.bind('<Return>', lambda e: save_settings())
+
+    def _show_player_client_help(self):
+        """Explain the Player Client options and name a recommendation.
+
+        Kept as plain concatenation (no f-strings) and routed through
+        the house _notify_info helper so it matches every other notice
+        and inherits its main-thread guard and messagebox fallback.
+        """
+        _nl = "\n"
+        msg = (
+            "Which YouTube client yt-dlp pretends to be. This changes how"
+            " much work each download costs." + _nl + _nl
+            + "RECOMMENDED: default" + _nl
+            + "  Lets yt-dlp choose. Most compatible. If you are passing"
+            + " cookies, yt-dlp picks tv_downgraded, which downloads the"
+            + " player JS and solves a challenge - roughly 3 seconds on"
+            + " every yt-dlp call." + _nl + _nl
+            + "FASTER, IF IT WORKS FOR YOU: android_vr" + _nl
+            + "  Needs no PO token and skips the JS challenge entirely."
+            + " Worth trying if you download in batches. Known caveat:"
+            + " it can intermittently return only format 18 (360p"
+            + " pre-muxed). If your downloads suddenly drop to 360p,"
+            + " switch back to default." + _nl + _nl
+            + "  visionos behaves similarly and is newer." + _nl
+            + "  android_vr,default falls back automatically if"
+            + " android_vr returns nothing usable - a safer middle"
+            + " ground than android_vr alone." + _nl + _nl
+            + "REQUIRE A BGUTIL SERVER: android, ios" + _nl
+            + "  These need a GVS PO token. With no bgutil server"
+            + " running, formats will be missing or downloads will"
+            + " fail. Start it in Settings > bgutil before using these."
+            + _nl + _nl
+            + "OTHERS" + _nl
+            + "  tv / tv_downgraded - no PO token, but pay the JS"
+            + " challenge." + _nl
+            + "  web_embedded - sometimes works around age-restricted"
+            + " videos." + _nl + _nl
+            + "This setting applies to downloads only. Analysis uses its"
+            + " own client cascade and is unaffected."
+        )
+        self._notify_info("Player Client", msg)
 
     def get_player_client_extractor_args(self):
         """Return the --extractor-args list for the configured player client.
@@ -10547,16 +10998,19 @@ Total Streams: {len(self.current_formats)}"""
                                             _vid_w, _vid_h = 640, 360
                                     _orig_size = str(_vid_w) + 'x' + str(_vid_h)
                                     _vf = 'subtitles=hs_sub.srt:original_size=' + _orig_size
-                                    _d_sub_cmd = [
-                                        self.ffmpeg_path, '-y',
-                                        '-i', output_path,
-                                        '-c:v', 'libx264', '-crf', '23', '-preset', 'veryfast',
+                                    _d_hs_pre = ([self.ffmpeg_path, '-y']
+                                                 + self._hardsub_input_args()
+                                                 + ['-i', output_path])
+                                    _d_hs_post = [
                                         '-vf', _vf,
                                         '-c:a', 'copy',
                                         '-movflags', '+faststart',
                                         '-loglevel', 'error',
                                         _d_sub_out
                                     ]
+                                    _d_sub_cmd = (_d_hs_pre
+                                                  + self._hardsub_codec_args()
+                                                  + _d_hs_post)
                                     _d_cwd = _d_temp_dir
                                 elif _d_sub_file:
                                     # Soft sub: stream copy, embed as mov_text track
@@ -10580,6 +11034,24 @@ Total Streams: {len(self.current_formats)}"""
                                             timeout=None if _d_is_hs else 120,
                                             cwd=_d_cwd,
                                             creationflags=CREATE_NO_WINDOW)
+                                        if (_d_is_hs and _d_res.returncode != 0
+                                                and _d_sub_cmd[5] != 'libx264'):
+                                            # Real input defeated the hardware encoder even
+                                            # though the synthetic probe passed: pin the
+                                            # session to software and redo THIS burn once.
+                                            self._hardsub_demote(
+                                                'direct burn', _d_res.returncode)
+                                            _d_sub_cmd = ([self.ffmpeg_path, '-y']
+                                                          + self._hardsub_input_args()
+                                                          + ['-i', output_path]
+                                                          + self._hardsub_codec_args()
+                                                          + _d_hs_post)
+                                            _d_res = subprocess.run(
+                                                _d_sub_cmd,
+                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                text=True, encoding='utf-8', errors='replace',
+                                                timeout=None, cwd=_d_cwd,
+                                                creationflags=CREATE_NO_WINDOW)
                                         if _d_res.returncode == 0 and os.path.exists(_d_sub_out):
                                             # Retry loop for WinError 5 (Access Denied) -
                                             # can occur when the premuxed cache write briefly
@@ -10630,11 +11102,9 @@ Total Streams: {len(self.current_formats)}"""
                 # Check whether any subtitle was actually embedded by comparing
                 # file size - if the subtitle embed ran, the output was replaced.
                 # Simpler: check if the name contains the mode suffix and rewrite.
-                _base = os.path.splitext(output_path)[0]
                 _ext  = os.path.splitext(output_path)[1]
                 # Build the clean name without the sub tag
                 _lang_upper = (_fn_lang or 'en').upper()
-                _quality_tag_clean = quality.rstrip('p') + 'D ' + _lang_upper if 'D' not in quality else quality + ' ' + _lang_upper
                 _clean_path = self._unique_output_path(
                     os.path.join(self.download_path,
                                  self._assemble_filename(video_info or {}, quality.rstrip('p') + 'D ' + _lang_upper, _ext)),
@@ -10843,6 +11313,56 @@ Total Streams: {len(self.current_formats)}"""
             self.append_terminal_output(
                 label + ' partial removed after HTTP 416 (size unverifiable)'
                 ' - will re-download fresh.\n', 'warning')
+        except Exception:
+            pass
+
+    def _log_audio_leg(self, fid, rc, out_b, err_b):
+        """Replay the background audio leg's yt-dlp output into the LOG.
+
+        The audio half of a merge already captured both streams and then
+        threw stdout away, so half of every merge download was invisible:
+        its format choice, its 'Sleeping N seconds' lines and its errors
+        never reached the log this project debugs from.
+
+        Log file ONLY, and marshalled to the main thread:
+          - _write_session_log documents itself as single-threaded (its
+            line-start flag and file handle are unguarded), so this goes
+            through root.after(0, ...) like every other worker write.
+          - it deliberately does NOT use append_terminal_output: that
+            fans out to _output_listeners, and the scenario runner times
+            pause_at_percent off that stream (tests 46 and 54). A second
+            progress source there could move when a scenario pauses.
+          - it runs AFTER communicate() returns, so neither the
+            concurrency nor the ordering of the live video output moves.
+
+        Repeating progress lines are dropped (a final 100% is kept), so
+        this cannot drown the log the way the per-invocation cookie
+        staleness warning once did. One after() call, not one per line.
+        """
+        try:
+            if not getattr(self, '_session_log_fh', None):
+                return
+            _txt = ''
+            for _raw in (out_b, err_b):
+                if not _raw:
+                    continue
+                if isinstance(_raw, bytes):
+                    _txt += _raw.decode('utf-8', errors='replace')
+                else:
+                    _txt += str(_raw)
+            _keep = []
+            for _l in _txt.replace('\r', '\n').split('\n'):
+                _l = _l.rstrip()
+                if not _l:
+                    continue
+                if '[download]' in _l and '%' in _l and '100%' not in _l:
+                    continue
+                _keep.append('[audio] ' + _l)
+            _body = ('audio leg (ID ' + str(fid) + ') finished rc=' + str(rc)
+                     + ', output replayed below:\n')
+            if _keep:
+                _body += '\n'.join(_keep) + '\n'
+            self.root.after(0, lambda t=_body: self._write_session_log(t))
         except Exception:
             pass
 
@@ -11081,6 +11601,10 @@ Total Streams: {len(self.current_formats)}"""
                             self._audio_bg_process = proc
                             stdout_b, stderr_b = proc.communicate(timeout=7200)
                             self._audio_bg_process = None
+                            # Half of every merge used to be invisible: this
+                            # output was captured and then discarded.
+                            self._log_audio_leg(audio_format_id, proc.returncode,
+                                                stdout_b, stderr_b)
                             # Simulate a CompletedProcess-like result so the
                             # existing returncode / stderr checks below still work.
                             result = subprocess.CompletedProcess(
@@ -11464,8 +11988,13 @@ Total Streams: {len(self.current_formats)}"""
                             _vid_w, _vid_h = 256, 144
                     _orig_size = str(_vid_w) + 'x' + str(_vid_h)
                     _vf_filter = 'subtitles=hs_sub.srt:original_size=' + _orig_size
-                    # All -i inputs must come first, then output options
-                    merge_cmd = [self.ffmpeg_path, '-y', '-i', video_temp, '-i', audio_temp]
+                    # All -i inputs must come first, then output options.
+                    # This construction only runs on the hardsub branch, so the
+                    # hw-decode args need no gate; the softsub/copy branch below
+                    # builds its own command and is untouched.
+                    merge_cmd = ([self.ffmpeg_path, '-y']
+                                 + self._hardsub_input_args()
+                                 + ['-i', video_temp, '-i', audio_temp])
                     if thumb_path and os.path.exists(thumb_path):
                         merge_cmd += ['-i', thumb_path]
                     merge_cmd += ['-map', '0:v', '-map', '1:a']
@@ -11473,7 +12002,7 @@ Total Streams: {len(self.current_formats)}"""
                         merge_cmd += ['-map', '2',
                                       '-c:v:1', 'mjpeg',
                                       '-disposition:v:1', 'attached_pic']
-                    merge_cmd += ['-c:v:0', 'libx264', '-crf', '23', '-preset', 'veryfast',
+                    merge_cmd += self._hardsub_codec_args('-c:v:0') + [
                                   '-vf', _vf_filter,
                                   '-c:a', 'copy']
                 else:
@@ -11682,6 +12211,8 @@ Total Streams: {len(self.current_formats)}"""
                 merge_returncode = _ffmpeg_proc.returncode
 
                 if merge_returncode != 0:
+                    if _do_hardsub:
+                        self._hardsub_demote('merge burn', merge_returncode)
                     ffmpeg_err = (_merge_stdout or '').strip()[-500:]
                     raise Exception("FFmpeg merge failed (code " + str(merge_returncode) + "):\n" + ffmpeg_err)
 
@@ -11820,6 +12351,35 @@ Total Streams: {len(self.current_formats)}"""
                         fresh_vid_fid, fresh_aud_fid = self._resolve_fresh_format_ids(
                             fresh_info, video_format_id, audio_format_id, quality)
                         if fresh_vid_fid and fresh_aud_fid:
+                            # Guard 1 - identical ids. If the refresh handed
+                            # back exactly what just failed, the restart would
+                            # re-issue the same request and fail the same way.
+                            # This happens when the info leg and the download
+                            # leg use different player clients: info reports a
+                            # format the download client does not offer, and no
+                            # number of refreshes will change that.
+                            if (str(fresh_vid_fid) == str(video_format_id)
+                                    and str(fresh_aud_fid) == str(audio_format_id)):
+                                self.append_terminal_output(
+                                    "Refresh returned the same format IDs (video="
+                                    + str(fresh_vid_fid) + " audio="
+                                    + str(fresh_aud_fid) + ") - not a stale URL.\n"
+                                    "The download client may not offer this format. "
+                                    "Try Player Client = default in Settings.\n",
+                                    'error')
+                                raise
+                            # Guard 2 - depth. Mirrors _fmt_restart_depth in
+                            # the audio-only path: the restart below re-enters
+                            # this worker from inside its own except handler,
+                            # which resets `attempt` and defeats the attempt==0
+                            # check above.
+                            _d = getattr(self, '_fmt_restart_depth', 0)
+                            if _d >= 2:
+                                self.append_terminal_output(
+                                    "Format kept expiring after " + str(_d)
+                                    + " refreshes - giving up on this attempt.\n",
+                                    'error')
+                                raise
                             self.append_terminal_output(
                                 "Fresh format IDs: video=" + fresh_vid_fid +
                                 " audio=" + fresh_aud_fid + " - restarting download.\n", 'info')
@@ -11829,9 +12389,13 @@ Total Streams: {len(self.current_formats)}"""
                                 shutil.rmtree(temp_dir, ignore_errors=True)
                             except Exception:
                                 pass
-                            self._download_and_merge_worker_with_terminal(
-                                fresh_vid_fid, fresh_aud_fid, output_path, quality,
-                                False, None, None, url, video_id, fresh_info)
+                            self._fmt_restart_depth = _d + 1
+                            try:
+                                self._download_and_merge_worker_with_terminal(
+                                    fresh_vid_fid, fresh_aud_fid, output_path, quality,
+                                    False, None, None, url, video_id, fresh_info)
+                            finally:
+                                self._fmt_restart_depth = _d
                             return
                         elif fresh_vid_fid and fresh_aud_fid is None:
                             # Find actual resolution of combined stream so the
@@ -13010,6 +13574,126 @@ Total Streams: {len(self.current_formats)}"""
             return hh + ':' + mm + ':' + ss
         except (ValueError, TypeError):
             return None
+
+    def _hardsub_input_args(self):
+        """Input-side argv for a burn: hardware decode with hardware encode.
+
+        '-hwaccel auto' asks FFmpeg for the best available hardware
+        decoder and silently falls back to software when none fits. The
+        AV1 sources this app caches (itag 398/399) decode brutally
+        slowly on the CPU, which capped batch 1b's gains - the encode
+        moved to hardware while the decode leg stayed throttled. Rides
+        the same switch as the encoder: forced or demoted libx264 means
+        a FULLY software pipeline, so the direct path's failure retry
+        rebuilds with no hwaccel either.
+        """
+        if getattr(self, 'hardsub_encoder', 'libx264') == 'libx264':
+            return []
+        if self._pick_hardsub_encoder() == 'libx264':
+            return []
+        return ['-hwaccel', 'auto']
+
+    def _hardsub_codec_args(self, stream_spec='-c:v'):
+        """Video-codec argv slice for a subtitle burn (batch 1b).
+
+        'auto' (default) uses the probed hardware encoder; setting the
+        config key hardsub_encoder to 'auto' opts in to hardware - the
+        hand-editable escape hatch until the Settings row lands in 1c.
+        Quality mappings target libx264-crf-23-class output: QSV ICQ
+        global_quality 23, NVENC constqp qp 23 preset p4, AMF CQP 23
+        balanced. Logs one line per burn naming the encoder so field
+        logs always show which path produced a file.
+        """
+        _pref = getattr(self, 'hardsub_encoder', 'libx264')
+        enc = 'libx264' if _pref == 'libx264' else self._pick_hardsub_encoder()
+        if enc == 'h264_qsv':
+            args = [stream_spec, 'h264_qsv', '-global_quality', '23',
+                    '-preset', 'veryfast']
+        elif enc == 'h264_nvenc':
+            args = [stream_spec, 'h264_nvenc', '-rc', 'constqp',
+                    '-qp', '23', '-preset', 'p4']
+        elif enc == 'h264_amf':
+            args = [stream_spec, 'h264_amf', '-quality', 'balanced',
+                    '-rc', 'cqp', '-qp_i', '23', '-qp_p', '23']
+        else:
+            args = [stream_spec, 'libx264', '-crf', '23',
+                    '-preset', 'veryfast']
+        self.append_terminal_output(
+            'Hardsub: encoding with ' + args[1] + '.\n', 'info')
+        return args
+
+    def _hardsub_demote(self, where, rc):
+        """Hardware burn failed on a real input the probe's synthetic
+        test did not predict: pin this session to libx264 and say so.
+        No-op when already on software, so a plain libx264 failure
+        keeps today's behaviour byte-for-byte."""
+        if getattr(self, '_hardsub_encoder', None) in (None, 'libx264'):
+            return
+        self._hardsub_encoder = 'libx264'
+        self.append_terminal_output(
+            'Hardsub: hardware encode failed in ' + where + ' (rc='
+            + str(rc) + ') - falling back to libx264 for this session.\n',
+            'warning')
+
+    def _pick_hardsub_encoder(self):
+        """Best WORKING H.264 encoder for subtitle burn-in, probed once.
+
+        Batch 1b: the choice feeds _hardsub_codec_args() for BOTH burn
+        paths. If a hardware encode fails on a real input the synthetic
+        test did not predict, _hardsub_demote() pins this session back
+        to libx264 (the direct path also retries that burn once).
+
+        'ffmpeg -encoders' advertises what was COMPILED in, not what can
+        initialise on this machine (a CPU-only box still lists nvenc),
+        so each advertised candidate must pass a tiny null-sink test
+        encode before it is trusted. Preference order NVENC > QSV > AMF
+        per current benchmarks. Any failure anywhere means libx264 -
+        never an error. parallel_hardsub means workers can race here;
+        double-checked lock so the probe runs once per session.
+        """
+        got = getattr(self, '_hardsub_encoder', None)
+        if got:
+            return got
+        with self._hardsub_probe_lock:
+            got = getattr(self, '_hardsub_encoder', None)
+            if got:
+                return got
+            choice = 'libx264'
+            try:
+                if self.ffmpeg_path:
+                    r = subprocess.run(
+                        [self.ffmpeg_path, '-hide_banner', '-encoders'],
+                        capture_output=True, text=True, encoding='utf-8',
+                        errors='replace', timeout=10,
+                        creationflags=CREATE_NO_WINDOW)
+                    _adv = r.stdout or ''
+                    for _cand in ('h264_nvenc', 'h264_qsv', 'h264_amf'):
+                        if _cand not in _adv:
+                            continue
+                        t = subprocess.run(
+                            [self.ffmpeg_path, '-hide_banner',
+                             '-loglevel', 'error', '-f', 'lavfi', '-i',
+                             'testsrc2=duration=0.2:size=256x144:rate=10',
+                             '-frames:v', '3', '-c:v', _cand,
+                             '-f', 'null', '-'],
+                            capture_output=True, text=True, encoding='utf-8',
+                            errors='replace', timeout=20,
+                            creationflags=CREATE_NO_WINDOW)
+                        if t.returncode == 0:
+                            choice = _cand
+                            break
+            except Exception:
+                choice = 'libx264'
+            self._hardsub_encoder = choice
+            if choice == 'libx264':
+                self.append_terminal_output(
+                    'Hardsub encoder probe: libx264 - software (no working'
+                    ' hardware encoder found).\n', 'info')
+            else:
+                self.append_terminal_output(
+                    'Hardsub encoder probe: ' + choice + ' - HARDWARE'
+                    ' encoder selected for burn-in.\n', 'info')
+            return choice
 
     def _unique_output_path(self, preferred_path, video_id=None):
         """Return preferred_path if it does not exist on disk, otherwise append
@@ -14725,9 +15409,22 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             "Embed Metadata: " + ("ON" if self.embed_metadata_enabled.get() else "OFF") + "\n", "info")
         self.append_terminal_output(
             "Audio Only Mode: " + ("ON (MP3 output)" if self.audio_only_mode.get() else "OFF") + "\n", "info")
-        # Show cookie status
+        # Show cookie status. The toolbar toggle gates what is actually
+        # SENT (get_ytdlp_cookies_args returns [] while it is off), so
+        # this banner must report the toggle, not just what sits on
+        # disk - it used to claim 'cookies.txt (today)' in green while
+        # cookies were deliberately disabled to rest a flagged account.
+        _ck_on = getattr(self, '_m_cookies_on',
+                         getattr(self, 'cookies_enabled', True))
         _cf = getattr(self, "cookies_file", "") or ""
-        if _cf and os.path.isfile(_cf):
+        _ck_browser = getattr(self, "cookies_browser", "none") or "none"
+        if not _ck_on and (_cf or _ck_browser != "none"):
+            _what = (os.path.basename(_cf) if _cf
+                     else "browser=" + _ck_browser)
+            self.append_terminal_output(
+                "Cookies: OFF (toolbar toggle) - " + _what
+                + " is configured but NOT sent.\n", "warning")
+        elif _cf and os.path.isfile(_cf):
             try:
                 _age_d = int((time.time() - os.path.getmtime(_cf)) / 86400)
                 _age_str = ("today" if _age_d == 0 else str(_age_d) + "d old")
@@ -14743,6 +15440,28 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             else:
                 self.append_terminal_output(
                     "Cookies: NONE - bot-check errors likely. Add cookies.txt in Settings.\n", "warning")
+        # bgutil status, autostart and the yt-dlp diagnostic run on a
+        # worker: probing the server blocks up to 2 x 0.6s when it is
+        # down (urlopen ping, then the TCP fallback), and root.after
+        # callbacks run on the main thread. Same pattern as the Settings
+        # probe (_refresh_bgutil_status, test 42) and the diagnostic
+        # thread that already lived inside this block.
+        threading.Thread(target=self._bgutil_startup_status,
+                         daemon=True).start()
+
+    def _bgutil_startup_status(self):
+        """bgutil startup status + optional autostart + yt-dlp diagnostic.
+
+        Runs on a daemon thread: _bgutil_check_server() blocks up to 0.6s
+        twice when the server is down, which stalled the UI at every
+        launch while this ran inside a root.after callback. Safe off the
+        main thread: every terminal write goes through
+        append_terminal_output, whose guard marshals back to the main
+        thread; _bgutil_check_plugin() only touches the filesystem; and
+        _bgutil_running defaults to False in __init__, so an info fetch
+        racing this probe takes the extended-cascade path it would take
+        anyway while the server is down.
+        """
         # bgutil PO token provider status
         # Auto-start bgutil server if configured
         _bgutil_plugin_ok = self._bgutil_check_plugin()
@@ -15001,6 +15720,11 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             self.player_client = self._cfg_get(cfg, 'player_client', self.player_client)
             self.prewarm_enabled = self._cfg_get(cfg, 'prewarm_enabled', self.prewarm_enabled, bool)
             self.parallel_hardsub = self._cfg_get(cfg, 'parallel_hardsub', self.parallel_hardsub, bool)
+            self.hardsub_encoder = self._cfg_get(cfg, 'hardsub_encoder', 'libx264', str)
+            self.clear_cache_on_exit = self._cfg_get(cfg, 'clear_cache_on_exit', self.clear_cache_on_exit, bool)
+            self.preserve_logs_on_clear = self._cfg_get(cfg, 'preserve_logs_on_clear', True, bool)
+            self.preserve_ytdlp_on_clear = self._cfg_get(cfg, 'preserve_ytdlp_on_clear', False, bool)
+            self.preserve_history_on_clear = self._cfg_get(cfg, 'preserve_history_on_clear', False, bool)
             self.advance_queue_on_streams_done = self._cfg_get(cfg, 'advance_queue_on_streams_done', self.advance_queue_on_streams_done, bool)
             self.precache_concurrent_count = self._cfg_get(cfg, 'precache_concurrent_count', self.precache_concurrent_count, lambda v: max(1, int(v)))
             self.batch_concurrent_fetches = self._cfg_get(cfg, 'batch_concurrent_fetches', getattr(self, 'batch_concurrent_fetches', 3), lambda v: max(1, min(8, int(v))))
@@ -15096,6 +15820,10 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 'default_quality': self.default_quality,
                 'dark_mode': dmvar.get() if dmvar else self.dark_mode,
                 'persistent_cache': pvar.get() if pvar else self.persistent_cache,
+                'clear_cache_on_exit': self.clear_cache_on_exit,
+                'preserve_logs_on_clear': self.preserve_logs_on_clear,
+                'preserve_ytdlp_on_clear': self.preserve_ytdlp_on_clear,
+                'preserve_history_on_clear': self.preserve_history_on_clear,
                 'max_cache_mb': self.max_cache_mb,
                 'preferred_language': self.preferred_language,
                 'auto_update_tools': self.auto_update_tools,
@@ -15107,6 +15835,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 'player_client': self.player_client,
                 'prewarm_enabled': self.prewarm_enabled,
                 'parallel_hardsub': self.parallel_hardsub,
+                'hardsub_encoder': self.hardsub_encoder,
                 'precache_concurrent_count': self.precache_concurrent_count,
                 'batch_concurrent_fetches': getattr(self, 'batch_concurrent_fetches', 3),
                 'advance_queue_on_streams_done': self.advance_queue_on_streams_done,
@@ -15709,6 +16438,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
 
         # ── yt-dlp ────────────────────────────────────────────────────────────
         local_ytdlp = self._get_ytdlp_version()
+        import requests  # deferred - see _get_http_session at module top
         try:
             resp = requests.get(
                 'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest',
@@ -15852,6 +16582,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
     def _get_ffmpeg_latest_info(self):
         """Fetch the latest FFmpeg release from GyanD/codexffmpeg on GitHub.
         Returns (version_string, download_url) or (None, None) on failure."""
+        import requests  # deferred - see _get_http_session at module top
         try:
             api_url = 'https://api.github.com/repos/GyanD/codexffmpeg/releases/latest'
             resp = requests.get(api_url, timeout=10,
@@ -15948,6 +16679,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             _zip_dir = getattr(self, 'ysa_tmp_dir', None) or tempfile.gettempdir()
             zip_tmp = os.path.join(_zip_dir, 'ffmpeg_update.zip')
 
+            import requests  # deferred - see _get_http_session at module top
             try:
                 resp = requests.get(asset_url, stream=True, timeout=120)
                 resp.raise_for_status()
