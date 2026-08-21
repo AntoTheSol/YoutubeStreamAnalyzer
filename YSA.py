@@ -1254,6 +1254,11 @@ class YouTubeStreamAnalyzerGUI:
         self.persistent_cache = False
         self.max_cache_mb = 0
         self.auto_update_tools = True
+        # 'nightly' | 'stable'. Upstream's README calls nightly the recommended
+        # channel for regular users and warns that the latest stable release is
+        # often stale and prone to breakage when sites change. Nightly also
+        # ended a run of extraction failures here, so it is the default.
+        self.ytdlp_channel = 'nightly'
         # Resolution size-limit settings
         self.size_limit_enabled = False      # Enable size-based quality cap
         self.size_limit_mb = 500             # Max MB for preferred quality video stream
@@ -1320,6 +1325,14 @@ class YouTubeStreamAnalyzerGUI:
         # Audio stream preference
         self.preferred_audio_bitrate = 0     # 0 = highest available
         self.preferred_video_bitrate = 0     # 0 = highest available per resolution
+        # HLS/m3u8 video streams are hidden from Recommended by default. Their
+        # FILESIZE/TBR are advertised manifest figures, not measured: yt-dlp
+        # prints them with '~' and marks them Untested, and they can overstate
+        # badly (a 2.03GiB row delivered 447MB here; upstream reports 5.06GB ->
+        # 1.8GB). Every resolution they offer already has a DASH stream with an
+        # EXACT byte count, so nothing is lost. This is NOT about Premium -
+        # yt-dlp labels those 'Premium' explicitly and they are unaffected.
+        self.include_hls_streams = False
         self.audio_only_mode_default = False  # Persisted across sessions via config
         self.audio_only_format = 'm4a_native'         # 'm4a_native', 'm4a_aac', or 'mp3'
         # ── Audio behaviour settings (Settings > Audio) ──────────────────
@@ -2593,7 +2606,10 @@ class YouTubeStreamAnalyzerGUI:
         ttk.Label(top_bar, text='Filter:').pack(side=tk.LEFT, padx=(8, 4))
         self._history_filter_var = tk.StringVar(value='All')
         filter_combo = ttk.Combobox(top_bar, textvariable=self._history_filter_var,
-                                    values=['All', 'By Channel', 'By URL', 'By Title'],
+                                    values=['All', 'Failed only', 'By Channel',
+                                            'By URL', 'By Title'],
+                                    # 'Failed only' needs no search text - it
+                                    # filters on status, not on the query box.
                                     state='readonly', width=12)
         filter_combo.pack(side=tk.LEFT, padx=(0, 4))
         self._history_filter_var.trace_add('write', lambda *_: self._refresh_history_panel())
@@ -2666,6 +2682,12 @@ class YouTubeStreamAnalyzerGUI:
         if tree is None:
             return
         tree.delete(*tree.get_children())
+        # With nothing downloading, a still-'pending' entry is one that never
+        # finished - promote it to failed here so failures surface without
+        # waiting for a restart. Guarded on _download_active so a running
+        # download is never mislabelled mid-flight.
+        if not getattr(self, '_download_active', False):
+            self._sweep_pending_attempts('did not finish')
         query = self._history_search_var.get().strip().lower()
         filt = self._history_filter_var.get()
 
@@ -2677,6 +2699,11 @@ class YouTubeStreamAnalyzerGUI:
             ch = entry.get('channel', '')
             ti = entry.get('title', '')
             ur = entry.get('url', '')
+            # Entries written before this feature have no status; they are
+            # completed downloads, so they read as ok.
+            _st = entry.get('status') or 'ok'
+            if filt == 'Failed only' and _st != 'failed':
+                continue
             if query:
                 if filt == 'By Channel':
                     if query not in ch.lower():
@@ -2691,7 +2718,7 @@ class YouTubeStreamAnalyzerGUI:
                     combined = (ch + ' ' + ti + ' ' + ur).lower()
                     if query not in combined:
                         continue
-            filtered.append((ts, ud, ch, ti, ur))
+            filtered.append((ts, ud, ch, ti, ur, _st))
 
         # Sort
         _col_idx = {'timestamp': 0, 'upload_date': 1, 'channel': 2, 'title': 3, 'url': 4}
@@ -2699,8 +2726,11 @@ class YouTubeStreamAnalyzerGUI:
         filtered.sort(key=lambda row: row[_idx].lower() if row[_idx] else '',
                       reverse=self._history_sort_desc)
 
+        # Row 5 is the status; it is not a column, only a tag source.
+        tree.tag_configure('failed', foreground='#B3261E')
         for row in filtered:
-            tree.insert('', tk.END, values=row)
+            tree.insert('', tk.END, values=row[:5],
+                        tags=('failed',) if row[5] == 'failed' else ())
 
         # Update heading arrows to show current sort
         _labels = {'timestamp': 'Downloaded', 'upload_date': 'Uploaded',
@@ -5456,7 +5486,9 @@ class YouTubeStreamAnalyzerGUI:
                 self.root.after(0, lambda n=attempt_num, lb=label:
                     self.append_terminal_output(
                         'Info OK on attempt ' + str(n) + ' (' + lb + ').\n', 'success'))
-                return json.loads(r.stdout)
+                _info = json.loads(r.stdout)
+                self.root.after(0, lambda i=_info: self._log_stream_url_lifetime(i))
+                return _info
 
             stderr = (r.stderr or '').strip()
             # If 'Requested format is not available', retry with explicit format
@@ -6630,8 +6662,12 @@ class YouTubeStreamAnalyzerGUI:
         tree.tag_configure('combination_selected',    background='lightcyan',   foreground='')
         tree.tag_configure('combination_other',       background='lightcoral',  foreground='')
 
-        # Bind double-click event
-        tree.bind('<Double-1>', lambda e: self.show_combination_details(e))
+        # Double-click merges; the details dialog moves to right-click so
+        # nothing is lost. (The earlier double-click handler patched for
+        # this was on_stream_double_click, which belongs to a different
+        # tree - this is the one the Recommended tab actually uses.)
+        tree.bind('<Double-1>', lambda e: self.on_recommended_double_click(e))
+        tree.bind('<Button-3>', lambda e: self.show_combination_details(e))
 
     def is_valid_youtube_url(self, url):
         """Check if the URL is a valid YouTube URL"""
@@ -7457,6 +7493,32 @@ class YouTubeStreamAnalyzerGUI:
             format_id = str(fmt.get('format_id', ''))
             self.all_tree.insert('', 'end', values=("Audio", quality, container, size, 'none', acodec, format_id))
     
+    def _stream_size_bytes(self, fmt, duration=None):
+        """Best available size for one stream, in bytes (0 if truly unknown).
+
+        Three tiers, because YouTube supplies different ones per protocol:
+          1. filesize        - exact; DASH/https formats carry it
+          2. filesize_approx - yt-dlp's own estimate, the '~' in -F output
+          3. bitrate x duration - computed here, because HLS/m3u8 formats
+             frequently carry NEITHER of the above. Those are exactly the
+             streams a 'highest bitrate' setting selects, so without this
+             tier the best rows were the ones showing no size at all.
+
+        kbit/s x seconds / 8 x 1000 = bytes, i.e. x125.
+        """
+        try:
+            n = fmt.get('filesize') or fmt.get('filesize_approx')
+            if n:
+                return int(n)
+            br = fmt.get('tbr') or fmt.get('vbr') or fmt.get('abr')
+            if duration is None:
+                duration = (self.current_video_info or {}).get('duration')
+            if br and duration:
+                return int(float(br) * float(duration) * 125.0)
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return 0
+
     def _populate_recommended_combinations(self, suppress_auto_download=False):
         """Populate recommended video+audio combinations with cache awareness"""
         if not hasattr(self, 'recommended_tree'):
@@ -7515,7 +7577,17 @@ class YouTubeStreamAnalyzerGUI:
                 values=(quality, video_info, audio_info, size, "Single file - ready to use"),
                 tags=(tag,))
 
-        # Video+audio combinations for DASH quality levels
+        # Video+audio combinations for DASH quality levels.
+        # Same rule the combined-stream loop above already applies: HLS
+        # variants duplicate resolutions the DASH streams already cover,
+        # and their sizes are manifest claims rather than measurements.
+        # Guarded - if a video somehow offers ONLY HLS, keep them rather
+        # than show an empty list.
+        if not getattr(self, 'include_hls_streams', False):
+            _dash_only = [v for v in video_streams
+                          if 'm3u8' not in (v.get('protocol') or '').lower()]
+            if _dash_only:
+                video_streams = _dash_only
         def _eff_quality(v):
             h = v.get('height', 0) or 0
             w = v.get('width', 0) or 0
@@ -7528,6 +7600,7 @@ class YouTubeStreamAnalyzerGUI:
         # and Smart Quality use _nearest_standard_quality to map these to
         # the closest standard tier when the user's setting is a standard
         # value like "1080p".
+        _est_rows = 0   # rows whose size is a bitrate estimate, not measured
         seen_qualities = set()
         quality_order = []  # unique _eff values, highest first
         for v in sorted(video_streams, key=lambda x: _eff_quality(x), reverse=True):
@@ -7553,8 +7626,20 @@ class YouTubeStreamAnalyzerGUI:
                                "🗂️ "   if video_cached else
                                "🎵 "   if audio_cached else "")
 
-            video_size  = best_video.get('filesize', 0) or 0
-            audio_size  = best_audio.get('filesize', 0) or 0
+            # HLS/m3u8 formats often carry neither filesize nor
+            # filesize_approx, and those are precisely the streams a
+            # 'highest bitrate' setting picks - so the best rows were the
+            # ones reading 'Video only' with no figure at all.
+            _dur = (self.current_video_info or {}).get('duration')
+            video_size  = self._stream_size_bytes(best_video, _dur)
+            audio_size  = self._stream_size_bytes(best_audio, _dur)
+            # A number the user cannot tell is a guess is worse than no
+            # number: a row read 2.1 GB and delivered 543 MB. Only an
+            # exact filesize on BOTH streams may be shown unmarked.
+            _exact = bool(best_video.get('filesize')) and bool(best_audio.get('filesize'))
+            _approx = '' if _exact else '~'
+            if not _exact:
+                _est_rows += 1
             video_info  = (best_video.get('ext', 'unknown') + " " +
                            best_video.get('vcodec', '')[:10] + " (" + video_format_id + ")")
             audio_info  = best_audio.get('ext', 'unknown') + " " + best_audio.get('description', 'unknown')
@@ -7570,7 +7655,8 @@ class YouTubeStreamAnalyzerGUI:
                 size_str = ("~" + self.format_file_size(video_size)) if video_size else "Video only"
             else:
                 total = video_size + audio_size
-                size_str = self.format_file_size(total) if total else "Unknown"
+                size_str = ((_approx + self.format_file_size(total))
+                            if total else "Unknown")
 
             selected_lang = best_audio.get('detected_language', 'unknown')
             lang_name     = self.get_language_name(selected_lang)
@@ -7617,16 +7703,41 @@ class YouTubeStreamAnalyzerGUI:
         limit = getattr(self, 'preferred_video_bitrate', 0)
 
         def _vbr(s):
-            return s.get('vbr') or s.get('tbr') or 0
+            """Bitrate in kbps, or None when the source did not report one.
+
+            This used to end in "or 0", which made an UNMEASURED stream
+            look like the worst one in the pool. A cap of 1 then selected
+            exactly those unmeasured formats while a cap of 0 ignored them
+            entirely - which is how "maximum bitrate" ended up returning
+            something smaller than "minimum bitrate". Unknown is now
+            unknown: ranked last, never mistaken for lowest, and never
+            excluded outright so a pool with no bitrate data still
+            resolves to a real stream.
+            """
+            v = s.get('vbr') or s.get('tbr')
+            try:
+                return float(v) if v else None
+            except (TypeError, ValueError):
+                return None
+
+        known = [s for s in candidates if _vbr(s) is not None]
+
+        def _key(s):
+            return _vbr(s) or 0.0
 
         if limit and limit > 0:
-            under = [s for s in candidates if _vbr(s) <= limit]
+            under = [s for s in known if _vbr(s) <= limit]
             if under:
-                return max(under, key=_vbr)
-            # All streams exceed the limit - pick the lowest available
-            # (closest to what the user requested) rather than the highest.
-            return min(candidates, key=_vbr)
-        return max(candidates, key=_vbr)
+                return max(under, key=_key)
+            if known:
+                # Everything measured exceeds the cap - take the lowest
+                # measured stream, the closest to what was asked for.
+                return min(known, key=_key)
+            # Nothing carries a bitrate at all: fall back rather than fail.
+            return candidates[0]
+        if known:
+            return max(known, key=_key)
+        return candidates[0]
 
     def select_best_audio_stream(self, audio_streams, detected_languages):
         """Select the best audio stream based on user preference.
@@ -8021,10 +8132,36 @@ Total Streams: {len(self.current_formats)}"""
         self._notify_info("Copied", "Video information copied to clipboard!")
     
     def on_stream_double_click(self, event, tree):
-        """Handle double-click on stream item"""
-        selection = tree.selection()
-        if selection:
+        """Double-click a recommended stream: show its URL, then download.
+
+        The URL still goes to the terminal (the previous behaviour of this
+        handler), so nothing is lost - but the double-click now also starts
+        the merge, which is what it reads as. Selecting a row and pressing
+        Merge is unchanged.
+
+        Guarded against the obvious foot-gun: if a download is already
+        running, or the Merge button is disabled (nothing analysed yet),
+        the double-click reports why instead of starting a second job.
+        """
+        if not tree.selection():
+            return
+        try:
             self.get_stream_url()
+        except Exception:
+            pass
+        if getattr(self, '_download_active', False):
+            self.append_terminal_output(
+                'A download is already running - double-click ignored.\n',
+                'info')
+            return
+        try:
+            if str(self.download_merge_btn['state']) == 'disabled':
+                self.append_terminal_output(
+                    'Nothing to merge yet - analyse a video first.\n', 'info')
+                return
+        except Exception:
+            pass
+        self.download_and_merge()
     
     def clear_all(self):
         """Clear all data and reset UI"""
@@ -8235,6 +8372,17 @@ Total Streams: {len(self.current_formats)}"""
                                   foreground="gray", font=('Arial', 8))
         ytdlp_ver_lbl.pack(side=tk.LEFT, padx=(8, 0))
 
+        ttk.Label(ytdlp_info_frame, text="Channel:",
+                  font=('Arial', 8)).pack(side=tk.LEFT, padx=(12, 2))
+        ytdlp_channel_var = tk.StringVar(
+            value=getattr(self, 'ytdlp_channel', 'nightly'))
+        ttk.Combobox(ytdlp_info_frame, textvariable=ytdlp_channel_var,
+                     values=('nightly', 'stable'), state='readonly',
+                     width=9).pack(side=tk.LEFT)
+        # Packed BEFORE the update button on purpose: that button is
+        # pack_forget()-ed and re-packed as updates appear, and side=LEFT
+        # re-packing appends to the END - anything added after it would be
+        # jumped over when it reappears.
         ytdlp_upd_btn = ttk.Button(ytdlp_info_frame, text="Update yt-dlp")
         # Button wired below after _do_update_ytdlp is defined
         ytdlp_upd_btn.pack(side=tk.LEFT, padx=(12, 0))
@@ -8274,7 +8422,7 @@ Total Streams: {len(self.current_formats)}"""
             import requests  # deferred - see _get_http_session at module top
             try:
                 resp = requests.get(
-                    'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest',
+                    self._ytdlp_release_api_url(),
                     timeout=8, headers={'Accept': 'application/vnd.github+json'})
                 resp.raise_for_status()
                 latest_v = resp.json().get('tag_name', '').strip()
@@ -8304,7 +8452,18 @@ Total Streams: {len(self.current_formats)}"""
             def _after():
                 threading.Thread(target=_fetch_ytdlp_status, daemon=True).start()
             def _run():
-                self._update_ytdlp()
+                # Same hazard as the automatic path: replacing yt-dlp.exe
+                # while an invocation is in flight corrupts it mid-read.
+                # The automatic updater was gated first; this manual button
+                # was not, so an update could still land during a download.
+                if (getattr(self, '_download_active', False)
+                        or self._any_ytdlp_running()):
+                    self.append_terminal_output(
+                        'yt-dlp update skipped - a download or extraction is'
+                        ' running. Stop it and press Update again.\n',
+                        'warning')
+                else:
+                    self._update_ytdlp()
                 try:
                     if dialog.winfo_exists():
                         dialog.after(500, _after)
@@ -8765,9 +8924,25 @@ Total Streams: {len(self.current_formats)}"""
         # ── Stream bitrate preferences ────────────────────────────────────
         ttk.Label(tab_dl, text="Stream Bitrate:", font=('Arial', 9, 'bold')).grid(
             row=15, column=0, sticky=tk.W, padx=8, pady=(2, 4))
+        include_hls_var = tk.BooleanVar(
+            value=getattr(self, 'include_hls_streams', False))
+        ttk.Checkbutton(tab_dl,
+                        text="Include HLS streams (sizes are estimates, not measured)",
+                        variable=include_hls_var).grid(
+            row=16, column=0, columnspan=4, sticky=tk.W, padx=24, pady=(2, 0))
+        ttk.Label(tab_dl,
+                  text="Off by default: HLS rows show advertised sizes that can be\n"
+                       "several times the real file. Every resolution they offer is\n"
+                       "already covered by a DASH stream with an exact size.",
+                  font=('Arial', 8), foreground='gray').grid(
+            row=17, column=0, columnspan=4, sticky=tk.W, padx=42, pady=(0, 4))
 
+        # row 19, not 15: at 15 this label was drawn into the same cell as
+        # the "Stream Bitrate:" section header (Tk stacks silently), while
+        # its own entry sat four rows lower at 19 with nothing beside it.
+        # Rows 16-18 hold no widgets, so they collapse to zero height.
         ttk.Label(tab_dl, text="Max audio bitrate (kbps):").grid(
-            row=15, column=0, sticky=tk.W, padx=8, pady=(2, 2))
+            row=19, column=0, sticky=tk.W, padx=8, pady=(2, 2))
         audio_bitrate_var = tk.StringVar(value=str(getattr(self, 'preferred_audio_bitrate', 0)))
         audio_bitrate_entry = ttk.Entry(tab_dl, textvariable=audio_bitrate_var, width=8)
         audio_bitrate_entry.grid(row=19, column=1, sticky=tk.W, padx=8, pady=(2, 2))
@@ -9512,8 +9687,11 @@ Total Streams: {len(self.current_formats)}"""
         ttk.Button(_bgutil_btn_frame, text="Stop Server",
                    command=_bgutil_stop).pack(side=tk.LEFT, padx=(0, 8))
 
+        # row 15, not 12: at 12 this separator shared a cell with the one
+        # above the action buttons, so Tk drew one over the other and the
+        # guide divider appeared ABOVE the buttons instead of below them.
         ttk.Separator(tab_bgutil, orient=tk.HORIZONTAL).grid(
-            row=12, column=0, columnspan=4, sticky=(tk.W, tk.E), padx=8, pady=6)
+            row=15, column=0, columnspan=4, sticky=(tk.W, tk.E), padx=8, pady=6)
 
         # ── Plain-English setup guide (no terminal required) ──────────────
         if _has_bundle:
@@ -9551,7 +9729,7 @@ Total Streams: {len(self.current_formats)}"""
             )
         ttk.Label(tab_bgutil, text=guide,
                   font=('Consolas', 8), foreground='gray', justify=tk.LEFT).grid(
-            row=15, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(0, 8))
+            row=16, column=0, columnspan=4, sticky=tk.W, padx=12, pady=(0, 8))
 
         # Refresh status when tab becomes visible
         tab_bgutil.bind('<Visibility>', lambda e: _refresh_bgutil_status())
@@ -9787,6 +9965,13 @@ Total Streams: {len(self.current_formats)}"""
             self.preserve_ytdlp_on_clear = preserve_ytdlp_var.get()
             self.preserve_history_on_clear = preserve_hist_var.get()
             self.auto_update_tools = auto_upd_var.get()
+            _new_ch = ytdlp_channel_var.get()
+            if _new_ch != getattr(self, 'ytdlp_channel', 'nightly'):
+                self.ytdlp_channel = _new_ch
+                self.append_terminal_output(
+                    'yt-dlp channel set to ' + _new_ch
+                    + " - press 'Update yt-dlp' in Settings > Executables"
+                    ' to switch the binary over.\n', 'info')
 
             self.player_client = client_var.get()
             self.prewarm_enabled = prewarm_var.get()
@@ -9835,6 +10020,7 @@ Total Streams: {len(self.current_formats)}"""
                 self.preferred_video_bitrate = max(0, int(video_bitrate_var.get()))
             except ValueError:
                 self.preferred_video_bitrate = 0
+            self.include_hls_streams = include_hls_var.get()
             # Refresh recommended combinations so sizes update immediately
             if self.current_formats:
                 self._populate_recommended_combinations(suppress_auto_download=True)
@@ -10378,6 +10564,8 @@ Total Streams: {len(self.current_formats)}"""
         # Idle - start immediately - set _download_active NOW, before any
         # call tree runs, so a second click always sees busy=True.
         self._download_active = True
+        self._record_attempt(self.url_var.get().strip(),
+                             self.current_video_info)
         self._download_stopped = False
         self._reset_download_buttons()
         self.download_recommended_selection()
@@ -11313,6 +11501,53 @@ Total Streams: {len(self.current_formats)}"""
             self.append_terminal_output(
                 label + ' partial removed after HTTP 416 (size unverifiable)'
                 ' - will re-download fresh.\n', 'warning')
+        except Exception:
+            pass
+
+    def _log_stream_url_lifetime(self, info):
+        """Report how long this analysis' stream URLs stay valid. DIAGNOSTIC.
+
+        A merge download currently costs THREE yt-dlp extractions - the
+        analysis, the video leg and the audio leg - each doing its own
+        webpage fetch, player-API call and PO-token mint. Roughly 6-9
+        requests where 2-3 would do, which is what produced 133 bot-check
+        errors and 230s of enforced sleeps in a 109-video session.
+
+        The fix is to hand the already-fetched info to both legs with
+        --load-info-json, collapsing three extractions into one. The ONLY
+        real risk is that googlevideo URLs expire: every one carries an
+        'expire=<unix ts>' parameter. This logs the real window so the
+        decision rests on measurement rather than an assumed six hours.
+
+        Changes nothing. Reads the info dict already in memory, writes one
+        line, and never raises.
+        """
+        try:
+            import re as _re
+            _now = time.time()
+            _exp = []
+            for _f in (info or {}).get('formats') or []:
+                _u = _f.get('url') or ''
+                _m = _re.search(r'[?&]expire=(\d{9,})', _u)
+                if _m:
+                    _exp.append(int(_m.group(1)))
+            if not _exp:
+                self.append_terminal_output(
+                    'Stream URL lifetime: no expire= parameter found'
+                    ' (reuse would need a different freshness test).\n', 'info')
+                return
+            _left = int(min(_exp) - _now)
+            if _left <= 0:
+                self.append_terminal_output(
+                    'Stream URL lifetime: already expired at analysis time.\n',
+                    'warning')
+                return
+            _h, _m2 = _left // 3600, (_left % 3600) // 60
+            _spread = int(max(_exp) - min(_exp))
+            self.append_terminal_output(
+                'Stream URL lifetime: ' + str(_h) + 'h ' + str(_m2) + 'm'
+                + ' (' + str(len(_exp)) + ' formats, spread '
+                + str(_spread) + 's).\n', 'info')
         except Exception:
             pass
 
@@ -12776,8 +13011,19 @@ Total Streams: {len(self.current_formats)}"""
 
         # Keep scroll-region in sync with inner frame size
         def _on_inner_resize(event):
-            self._queue_canvas.configure(
-                scrollregion=self._queue_canvas.bbox("all"))
+            # bbox('all') is measured from the CURRENT layout. Tk lays out
+            # lazily, so when many queue rows are added at once this fires
+            # before the inner frame has been sized and returns the old
+            # (tiny) bounds - the canvas then believes it has almost
+            # nothing to show and paints blank until a scroll forces a
+            # relayout. Deferring to idle measures after layout instead.
+            def _apply():
+                try:
+                    self._queue_canvas.configure(
+                        scrollregion=self._queue_canvas.bbox("all"))
+                except Exception:
+                    pass
+            self._queue_canvas.after_idle(_apply)
         self._queue_listbox.bind("<Configure>", _on_inner_resize)
 
         # Stretch inner frame to match canvas width
@@ -13177,6 +13423,7 @@ Total Streams: {len(self.current_formats)}"""
             '\nStarting queued download: ' + entry['label'] + '\n', 'cache')
         self._download_stopped = False
         self._download_active = True   # Mark busy before thread starts to close race window
+        self._record_attempt(entry.get('url') or '', entry.get('video_info'))
         self._reset_download_buttons()
 
         # If there is a next item in the queue, fire a background pre-warm probe now
@@ -13717,6 +13964,41 @@ Total Streams: {len(self.current_formats)}"""
         ts = str(int(time.time()))[-6:]
         return base + ' (' + ts + ')' + ext
 
+
+    def on_recommended_double_click(self, event):
+        """Double-click a Recommended row: summarise it, then merge.
+
+        The row's details go to the terminal instead of a modal dialog, and
+        the download starts - which is what a double-click reads as. The
+        full details dialog is still available on right-click.
+
+        Guarded: no selection does nothing; an already-running download or a
+        disabled Merge button reports why rather than starting a second job.
+        """
+        tree = self.recommended_tree
+        sel = tree.selection()
+        if not sel:
+            return
+        try:
+            vals = tree.item(sel[0]).get('values') or []
+            if vals:
+                self.append_terminal_output(
+                    'Selected: ' + ' | '.join(str(v) for v in vals[:4]) + '\n',
+                    'info')
+        except Exception:
+            pass
+        if getattr(self, '_download_active', False):
+            self.append_terminal_output(
+                'A download is already running - double-click ignored.\n', 'info')
+            return
+        try:
+            if str(self.download_merge_btn['state']) == 'disabled':
+                self.append_terminal_output(
+                    'Nothing to merge yet - analyse a video first.\n', 'info')
+                return
+        except Exception:
+            pass
+        self.download_and_merge()
 
     def show_combination_details(self, event):
         """Show details about selected combination with caching info"""
@@ -15712,6 +15994,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             self.max_cache_mb = self._cfg_get(cfg, 'max_cache_mb', self.max_cache_mb, int)
             self.preferred_language = self._cfg_get(cfg, 'preferred_language', self.preferred_language)
             self.auto_update_tools = self._cfg_get(cfg, 'auto_update_tools', self.auto_update_tools, bool)
+            self.ytdlp_channel = self._cfg_get(cfg, 'ytdlp_channel', 'nightly', str)
             self.size_limit_enabled = self._cfg_get(cfg, 'size_limit_enabled', self.size_limit_enabled, bool)
             self.size_limit_mb = self._cfg_get(cfg, 'size_limit_mb', self.size_limit_mb, int)
             self.size_limit_fallback = self._cfg_get(cfg, 'size_limit_fallback', self.size_limit_fallback)
@@ -15768,6 +16051,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             self.subtitle_lang = self._cfg_get(cfg, 'subtitle_lang', self.subtitle_lang)
             self.preferred_audio_bitrate = self._cfg_get(cfg, 'preferred_audio_bitrate', self.preferred_audio_bitrate, int)
             self.preferred_video_bitrate = self._cfg_get(cfg, 'preferred_video_bitrate', self.preferred_video_bitrate, int)
+            self.include_hls_streams = self._cfg_get(cfg, 'include_hls_streams', False, bool)
             self.audio_only_mode_default = self._cfg_get(cfg, 'audio_only_mode', self.audio_only_mode_default, bool)
             self.audio_only_format = self._cfg_get(cfg, 'audio_only_format', getattr(self, 'audio_only_format', 'm4a_native'))
             self.audio_opus_naming = self._cfg_get(cfg, 'audio_opus_naming', self.audio_opus_naming, str)
@@ -15827,6 +16111,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 'max_cache_mb': self.max_cache_mb,
                 'preferred_language': self.preferred_language,
                 'auto_update_tools': self.auto_update_tools,
+                'ytdlp_channel': self.ytdlp_channel,
                 'size_limit_enabled': self.size_limit_enabled,
                 'size_limit_mb': self.size_limit_mb,
                 'size_limit_fallback': self.size_limit_fallback,
@@ -15865,6 +16150,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 'subtitle_lang': self.subtitle_lang,
                 'preferred_audio_bitrate': self.preferred_audio_bitrate,
                 'preferred_video_bitrate': self.preferred_video_bitrate,
+                'include_hls_streams': self.include_hls_streams,
                 'audio_only_mode': self.audio_only_mode.get() if hasattr(self, 'audio_only_mode') else self.audio_only_mode_default,
                 'audio_only_format': getattr(self, 'audio_only_format', 'm4a'),
                 'audio_opus_naming': getattr(self, 'audio_opus_naming', 'codec'),
@@ -15912,6 +16198,10 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         except Exception as e:
             print('Could not load history: ' + str(e))
 
+    def _sweep_pending_on_load(self):
+        """Anything left 'pending' from a previous session never finished."""
+        self._sweep_pending_attempts('interrupted - app closed before it finished')
+
     def _save_download_history(self):
         """Save download history to ysa_history.json."""
         history_file = os.path.join(SCRIPT_DIR, 'ysa_history.json')
@@ -15936,6 +16226,111 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             return 'ysa_fake_ytdlp' in str(getattr(self, 'ytdlp_path', '')).lower()
         except Exception:
             return False
+
+    def _history_key(self, url, video_info=None):
+        """One stable identity for a history row, used by BOTH recorders.
+
+        _record_attempt runs at download START, when video_info is often not
+        populated yet, so it had no id and keyed on the URL. _record_download
+        later keyed on the video id. The two never matched, so success
+        APPENDED a second row instead of replacing the pending one - and the
+        orphan was then swept to 'failed'. Six such pairs appeared in a
+        31-scenario run, every one an ok row beside a failed row with an
+        empty video_id.
+
+        The id is parsed out of the URL when the info dict cannot supply it,
+        so both callers derive the same key from the same download. Legacy
+        rows key identically (their URL yields the same id), so existing
+        duplicates collapse the next time that video is downloaded.
+        """
+        try:
+            import re as _re
+            _vid = ''
+            if video_info:
+                _vid = str(video_info.get('id') or '')
+            if not _vid and url:
+                _m = _re.search(
+                    r'(?:[?&]v=|/shorts/|/live/|/embed/|youtu\.be/)'
+                    r'([A-Za-z0-9_-]{8,})', str(url))
+                if _m:
+                    _vid = _m.group(1)
+            return _vid or (url or '')
+        except Exception:
+            return url or ''
+
+    def _record_attempt(self, url, video_info=None):
+        """Log a download the moment it STARTS, with status 'pending'.
+
+        Success later replaces this entry via the same video_id/URL dedup
+        that _record_download already uses, flipping it to 'ok'. Anything
+        that never reaches success therefore stays 'pending' - and a
+        'pending' entry with no download running is, by definition, a
+        download that did not finish. That covers errors, stops, crashes
+        and power loss identically, without hooking a single failure path
+        (there are more than ten places _download_active goes False).
+
+        Same gates as _record_download: honours the History toggle and
+        never records stub downloads.
+        """
+        try:
+            if not getattr(self, '_m_history_on',
+                           getattr(self, 'history_enabled', True)):
+                return
+            if self._stub_active():
+                return
+            if not url:
+                return
+            vid_id = (video_info.get('id') or '') if video_info else ''
+            _key = self._history_key(url, video_info)
+            if not vid_id and _key and _key != url:
+                vid_id = _key   # recovered from the URL
+            for i, ex in enumerate(self.download_history):
+                if self._history_key(ex.get('url', ''),
+                                     {'id': ex.get('video_id')}) == _key:
+                    ex['status'] = 'pending'
+                    ex['fail_reason'] = ''
+                    ex['timestamp'] = datetime.datetime.now().strftime(
+                        '%Y-%m-%d %H:%M:%S')
+                    self._save_download_history()
+                    return
+            self.download_history.append({
+                'url': url,
+                'channel': (video_info.get('uploader')
+                            or video_info.get('channel') or '') if video_info else '',
+                'title': (video_info.get('title') or '') if video_info else '',
+                'upload_date': '',
+                'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'file_path': '',
+                'video_id': vid_id,
+                'status': 'pending',
+                'fail_reason': '',
+            })
+            if len(self.download_history) > 500:
+                self.download_history = self.download_history[-500:]
+            self._save_download_history()
+        except Exception:
+            pass
+
+    def _sweep_pending_attempts(self, reason):
+        """Turn every still-'pending' entry into a failure.
+
+        Called when no download can possibly be running: at startup (the
+        previous session ended without finishing) and whenever the History
+        panel refreshes while idle. Returns True if anything changed, so
+        the caller can avoid a pointless save.
+        """
+        changed = False
+        try:
+            for ex in self.download_history:
+                if ex.get('status') == 'pending':
+                    ex['status'] = 'failed'
+                    ex['fail_reason'] = reason
+                    changed = True
+            if changed:
+                self._save_download_history()
+        except Exception:
+            pass
+        return changed
 
     def _record_download(self, file_path, url, video_info, quality, download_time):
         # History recording can be switched off from the History tab. Read
@@ -15965,13 +16360,18 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'file_path': file_path or '',
             'video_id': vid_id,
+            'status': 'ok',
+            'fail_reason': '',
         }
         # Check for existing entry with same video_id or same URL
-        _match_key = vid_id if vid_id else (url or '')
+        # Must derive exactly as _record_attempt does, or a completed
+        # download appends a new row beside its own pending one.
+        _match_key = self._history_key(url, video_info)
         replaced = False
         if _match_key:
             for i, existing in enumerate(self.download_history):
-                _ex_key = existing.get('video_id') or existing.get('url', '')
+                _ex_key = self._history_key(existing.get('url', ''),
+                                            {'id': existing.get('video_id')})
                 if _ex_key and _ex_key == _match_key:
                     self.download_history[i] = new_entry
                     replaced = True
@@ -16441,7 +16841,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         import requests  # deferred - see _get_http_session at module top
         try:
             resp = requests.get(
-                'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest',
+                self._ytdlp_release_api_url(),
                 timeout=8, headers={'Accept': 'application/vnd.github+json'})
             resp.raise_for_status()
             latest_ytdlp = resp.json().get('tag_name', '').strip()
@@ -16485,7 +16885,22 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                     self.append_terminal_output(
                         'Auto-updating ' + tool + ' (' + local_v + ' -> ' + latest_v + ')...\n', 'info')
                     if tool == 'yt-dlp':
-                        self._update_ytdlp()
+                        # Replacing yt-dlp.exe while an invocation is in
+                        # flight corrupts it mid-read: the running process
+                        # dies with 'Error -3 while decompressing data:
+                        # incorrect header check' and the caller burns
+                        # retries. Seen in the field costing 3 attempts and
+                        # ~18s. _any_ytdlp_running fails CLOSED, so an
+                        # ambiguous answer defers rather than risks it; the
+                        # update simply happens on a later launch.
+                        if (getattr(self, '_download_active', False)
+                                or self._any_ytdlp_running()):
+                            self.append_terminal_output(
+                                'yt-dlp update deferred - a download or an'
+                                ' extraction is still running. It will be'
+                                ' applied next launch.\n', 'info')
+                        else:
+                            self._update_ytdlp()
                     elif tool == 'ffmpeg':
                         self._update_ffmpeg()
                 self.root.after(0, lambda: self.status_var.set('Tools updated to latest versions'))
@@ -16516,6 +16931,19 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             pass
         return None
 
+    def _ytdlp_release_api_url(self):
+        """GitHub releases API for the channel yt-dlp is actually on.
+
+        Nightly builds live in a DIFFERENT repository (yt-dlp-nightly-builds).
+        Checking a nightly binary against the stable repo compares a tag like
+        2026.08.16.232941 with one like 2026.03.17 and reports nonsense - the
+        bug this method exists to remove.
+        """
+        if getattr(self, 'ytdlp_channel', 'nightly') == 'stable':
+            return 'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest'
+        return ('https://api.github.com/repos/yt-dlp/yt-dlp-nightly-builds'
+                '/releases/latest')
+
     def _update_ytdlp(self):
         """Run yt-dlp -U in a background thread and stream output to terminal."""
         if not self.ytdlp_path:
@@ -16524,7 +16952,8 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         self.append_terminal_output('Updating yt-dlp...\n', 'info')
         try:
             proc = subprocess.Popen(
-                self._ytdlp_head() + ['-U'],
+                self._ytdlp_head() + ['--update-to',
+                                      getattr(self, 'ytdlp_channel', 'nightly')],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace', bufsize=1,
                 creationflags=CREATE_NO_WINDOW)
@@ -17097,6 +17526,8 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         else:
             # Start immediately - same path as pressing Download & Merge while idle
             self._download_active = True
+            self._record_attempt(url_override or self.url_var.get().strip(),
+                                 vi_override or self.current_video_info)
             self._download_stopped = False
             self._reset_download_buttons()
             self.download_recommended_selection()
