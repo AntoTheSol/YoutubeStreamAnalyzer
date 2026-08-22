@@ -1333,6 +1333,12 @@ class YouTubeStreamAnalyzerGUI:
         # EXACT byte count, so nothing is lost. This is NOT about Premium -
         # yt-dlp labels those 'Premium' explicitly and they are unaffected.
         self.include_hls_streams = False
+        # Hand the already-fetched analysis to the download legs with
+        # --load-info-json instead of making each leg extract again. Stream
+        # URLs were measured at a 6-hour lifetime, so this is safe with a
+        # wide margin; any failure falls back automatically.
+        self.reuse_info_json = True
+        self._info_json_disabled = False
         self.audio_only_mode_default = False  # Persisted across sessions via config
         self.audio_only_format = 'm4a_native'         # 'm4a_native', 'm4a_aac', or 'mp3'
         # ── Audio behaviour settings (Settings > Audio) ──────────────────
@@ -11504,6 +11510,50 @@ Total Streams: {len(self.current_formats)}"""
         except Exception:
             pass
 
+    def _info_json_for_leg(self, video_info, temp_dir):
+        """Path to a reusable info JSON for this download, or None.
+
+        A merge costs THREE yt-dlp extractions - the analysis plus one per
+        leg - each doing its own webpage fetch, player-API call and PO-token
+        mint. Handing a leg the info we already have, via --load-info-json,
+        skips its extraction entirely.
+
+        Only safe while the stream URLs are still valid. Measured in the
+        field: googlevideo URLs carry expire= and last SIX HOURS, with a
+        spread of 0s across every format, so one check covers the whole
+        dict. A 15-minute margin is kept anyway.
+
+        Returns None - meaning 'use the URL, extract normally' - for any
+        doubt at all: setting off, no formats, no expire=, too close to
+        expiry, or an unwritable temp dir.
+        """
+        try:
+            if not getattr(self, 'reuse_info_json', True):
+                return None
+            if getattr(self, '_info_json_disabled', False):
+                return None
+            if not video_info or not temp_dir:
+                return None
+            import re as _re
+            _exp = []
+            for _f in video_info.get('formats') or []:
+                _m = _re.search(r'[?&]expire=(\d{9,})', _f.get('url') or '')
+                if _m:
+                    _exp.append(int(_m.group(1)))
+            if not _exp:
+                return None
+            if (min(_exp) - time.time()) < 900:
+                self.append_terminal_output(
+                    'Stream URLs expire within 15 minutes - re-extracting'
+                    ' rather than reusing the analysis.\n', 'info')
+                return None
+            _p = os.path.join(temp_dir, 'ysa_info.json')
+            with open(_p, 'w', encoding='utf-8') as _fh:
+                json.dump(video_info, _fh)
+            return _p
+        except Exception:
+            return None
+
     def _log_stream_url_lifetime(self, info):
         """Report how long this analysis' stream URLs stay valid. DIAGNOSTIC.
 
@@ -11819,7 +11869,15 @@ Total Streams: {len(self.current_formats)}"""
                     audio_args_bg.extend(self.get_ytdlp_dns_args())
                     if self.yt_dlp_cache_dir:
                         audio_args_bg.extend(['--cache-dir', self.yt_dlp_cache_dir])
-                    audio_args_bg.append(url)
+                    # Reuse the analysis instead of re-extracting, when the
+                    # stream URLs are still comfortably valid. Falls back to
+                    # the URL for any doubt; a failure disables reuse for the
+                    # rest of this download so the retry loop extracts afresh.
+                    _aj = self._info_json_for_leg(video_info, temp_dir)
+                    if _aj:
+                        audio_args_bg.extend(['--load-info-json', _aj])
+                    else:
+                        audio_args_bg.append(url)
 
                     _audio_result = [None]
                     _audio_exc = [None]
@@ -11840,6 +11898,14 @@ Total Streams: {len(self.current_formats)}"""
                             # output was captured and then discarded.
                             self._log_audio_leg(audio_format_id, proc.returncode,
                                                 stdout_b, stderr_b)
+                            if proc.returncode != 0 and _aj:
+                                # The reused info did not work. Extract normally
+                                # from here on rather than repeating the failure.
+                                self._info_json_disabled = True
+                                self.root.after(0, lambda: self.append_terminal_output(
+                                    'Reusing the analysis failed for the audio leg'
+                                    ' - falling back to a fresh extraction.\n',
+                                    'warning'))
                             # Simulate a CompletedProcess-like result so the
                             # existing returncode / stderr checks below still work.
                             result = subprocess.CompletedProcess(
@@ -16052,6 +16118,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             self.preferred_audio_bitrate = self._cfg_get(cfg, 'preferred_audio_bitrate', self.preferred_audio_bitrate, int)
             self.preferred_video_bitrate = self._cfg_get(cfg, 'preferred_video_bitrate', self.preferred_video_bitrate, int)
             self.include_hls_streams = self._cfg_get(cfg, 'include_hls_streams', False, bool)
+            self.reuse_info_json = self._cfg_get(cfg, 'reuse_info_json', True, bool)
             self.audio_only_mode_default = self._cfg_get(cfg, 'audio_only_mode', self.audio_only_mode_default, bool)
             self.audio_only_format = self._cfg_get(cfg, 'audio_only_format', getattr(self, 'audio_only_format', 'm4a_native'))
             self.audio_opus_naming = self._cfg_get(cfg, 'audio_opus_naming', self.audio_opus_naming, str)
@@ -16151,6 +16218,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 'preferred_audio_bitrate': self.preferred_audio_bitrate,
                 'preferred_video_bitrate': self.preferred_video_bitrate,
                 'include_hls_streams': self.include_hls_streams,
+                'reuse_info_json': self.reuse_info_json,
                 'audio_only_mode': self.audio_only_mode.get() if hasattr(self, 'audio_only_mode') else self.audio_only_mode_default,
                 'audio_only_format': getattr(self, 'audio_only_format', 'm4a'),
                 'audio_opus_naming': getattr(self, 'audio_opus_naming', 'codec'),
