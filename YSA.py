@@ -1338,6 +1338,18 @@ class YouTubeStreamAnalyzerGUI:
         # URLs were measured at a 6-hour lifetime, so this is safe with a
         # wide margin; any failure falls back automatically.
         self.reuse_info_json = True
+        # Hardsub quality. OFF means exactly 23 - byte-identical to the value
+        # that was hard-coded before this setting existed, so an untouched
+        # config encodes the same as it always did. The number is remembered
+        # while the toggle is off so it survives untick/retick.
+        self.hardsub_crf_custom = False
+        self.hardsub_crf = 23
+        # Verbose diagnostics: its own FILE and its own LOCK, so it never
+        # touches the terminal widget, _output_listeners or the main thread.
+        self.verbose_logging = False
+        self._verbose_fh = None
+        self._verbose_lock = threading.Lock()
+        self._vlog_last_cfg = None
         self._info_json_disabled = False
         self.audio_only_mode_default = False  # Persisted across sessions via config
         self.audio_only_format = 'm4a_native'         # 'm4a_native', 'm4a_aac', or 'mp3'
@@ -1489,6 +1501,10 @@ class YouTubeStreamAnalyzerGUI:
         else:
             disable_custom_dns()
         
+        # Before setup_ui, so the widgets capture the WRAPPED bound
+        # methods. Wrapping afterwards would leave every existing
+        # command= pointing at the original and silently record nothing.
+        self._vlog_wrap_actions()
         self.setup_ui()
 
         # Register window close handler so X button triggers clean shutdown
@@ -1688,6 +1704,26 @@ class YouTubeStreamAnalyzerGUI:
         terminal_controls = ttk.Frame(self.terminal_frame)
         terminal_controls.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
         
+        # Verbose toggle. Packed into the existing controls frame - no grid
+        # row is used, so no cell can collide.
+        self.verbose_log_var = tk.BooleanVar(
+            value=getattr(self, 'verbose_logging', False))
+
+        def _on_verbose_toggle():
+            self.verbose_logging = bool(self.verbose_log_var.get())
+            if self.verbose_logging:
+                self._vlog('VERBOSE LOGGING ENABLED')
+                self._vlog_environment()
+                self._vlog_recommended_rows('verbose enabled')
+            else:
+                self._vlog_close()
+            self._save_config()
+
+        ttk.Checkbutton(terminal_controls, text="Verbose log",
+                        variable=self.verbose_log_var,
+                        command=_on_verbose_toggle).pack(side=tk.RIGHT,
+                                                         padx=(5, 0))
+
         # Copy button
         self.copy_terminal_btn = ttk.Button(terminal_controls, text="Copy",
                                             command=self.copy_terminal)
@@ -2126,6 +2162,7 @@ class YouTubeStreamAnalyzerGUI:
                 return result
             else:
                 self.append_terminal_output("Running: " + " ".join(cmd[:3]) + "...\n", 'info')
+                self._vlog('YT-DLP SPAWN', [' '.join(str(c) for c in cmd)])
                 # The visible line is truncated to three tokens; the dev
                 # runner needs the whole vector to reproduce a failure.
                 self._emit_dev_event('spawn', argv=list(cmd))
@@ -7695,6 +7732,14 @@ class YouTubeStreamAnalyzerGUI:
                 values=(str(target_quality) + "p", video_info, audio_info, size_str, instructions),
                 tags=(tag,))
 
+        # 'refresh', not 'settings change': suppress_auto_download is true for
+        # a settings save AND for the rebuild that follows a completed
+        # download, so claiming a cause here states something this code
+        # cannot know. A CONFIG CHANGED block immediately before a refresh
+        # is what identifies a settings change - the log should show the
+        # evidence rather than assert the conclusion.
+        self._vlog_recommended_rows('refresh' if suppress_auto_download
+                                    else 'fresh analysis')
         # Auto-download best available quality if configured (fires once per fresh analysis)
         if not suppress_auto_download:
             self._auto_download_best_quality()
@@ -8964,6 +9009,39 @@ Total Streams: {len(self.current_formats)}"""
         ttk.Label(tab_dl, text="Max video bitrate (kbps):").grid(
             row=20, column=0, sticky=tk.W, padx=8, pady=(2, 2))
         video_bitrate_var = tk.StringVar(value=str(getattr(self, 'preferred_video_bitrate', 0)))
+        hardsub_crf_custom_var = tk.BooleanVar(
+            value=getattr(self, 'hardsub_crf_custom', False))
+        hardsub_crf_var = tk.StringVar(value=str(getattr(self, 'hardsub_crf', 23)))
+        _crf_row = ttk.Frame(tab_dl)
+        # row 45, under the Hardsub encoder menu at 43-44, because CRF only
+        # applies to hardsub burns. Tk places widgets by grid coordinates,
+        # not by creation order, so only this number moves - no widget
+        # construction is touched.
+        _crf_row.grid(row=45, column=0, columnspan=4, sticky=tk.W,
+                      padx=8, pady=(2, 6))
+        _crf_top = ttk.Frame(_crf_row)
+        _crf_top.pack(side=tk.TOP, anchor=tk.W)
+        _crf_entry = ttk.Entry(_crf_top, textvariable=hardsub_crf_var, width=6)
+
+        def _sync_crf_entry(*_a):
+            # Greyed out entirely while the toggle is off, so the state is
+            # unambiguous: the field cannot look editable and be ignored.
+            _crf_entry.config(
+                state=('normal' if hardsub_crf_custom_var.get() else 'disabled'))
+
+        ttk.Checkbutton(_crf_row, text="Custom hardsub quality (CRF):",
+                        variable=hardsub_crf_custom_var,
+                        command=_sync_crf_entry).pack(side=tk.LEFT)
+        _crf_entry.pack(side=tk.LEFT, padx=(6, 0))
+        _sync_crf_entry()
+        # The hint goes INSIDE _crf_row, not into tab_dl: a child frame has its
+        # own coordinate space, so nothing can collide with the bitrate rows.
+        ttk.Label(_crf_row,
+                  text="Software (libx264) burns only. Lower = better quality,\n"
+                       "larger files, slower encoding. 23 is the default.\n"
+                       "Below 17 or above 30 is unusual; 0 is lossless and huge.",
+                  font=('Arial', 8), foreground='gray').pack(
+            side=tk.TOP, anchor=tk.W, padx=(20, 0))
         video_bitrate_entry = ttk.Entry(tab_dl, textvariable=video_bitrate_var, width=8)
         video_bitrate_entry.grid(row=20, column=1, sticky=tk.W, padx=8, pady=(2, 2))
         _vbr_btn_frame = ttk.Frame(tab_dl)
@@ -10027,6 +10105,11 @@ Total Streams: {len(self.current_formats)}"""
             except ValueError:
                 self.preferred_video_bitrate = 0
             self.include_hls_streams = include_hls_var.get()
+            self.hardsub_crf_custom = hardsub_crf_custom_var.get()
+            try:
+                self.hardsub_crf = max(0, min(51, int(hardsub_crf_var.get())))
+            except ValueError:
+                self.hardsub_crf = 23
             # Refresh recommended combinations so sizes update immediately
             if self.current_formats:
                 self._populate_recommended_combinations(suppress_auto_download=True)
@@ -10258,6 +10341,8 @@ Total Streams: {len(self.current_formats)}"""
                     if self.yt_dlp_cache_dir:
                         vargs.extend(['--cache-dir', self.yt_dlp_cache_dir])
                     vargs.append(url)
+                    self._vlog('YT-DLP SPAWN (precache video)',
+                               [' '.join(str(c) for c in self._ytdlp_head() + vargs)])
                     proc = subprocess.Popen(
                         self._ytdlp_head() + vargs,
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -10307,6 +10392,8 @@ Total Streams: {len(self.current_formats)}"""
                     if self.yt_dlp_cache_dir:
                         aargs.extend(['--cache-dir', self.yt_dlp_cache_dir])
                     aargs.append(url)
+                    self._vlog('YT-DLP SPAWN (precache audio)',
+                               [' '.join(str(c) for c in self._ytdlp_head() + aargs)])
                     proc = subprocess.Popen(
                         self._ytdlp_head() + aargs,
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -11554,6 +11641,230 @@ Total Streams: {len(self.current_formats)}"""
         except Exception:
             return None
 
+    _VLOG_ACTIONS = (
+        'analyze_video', 'paste_and_analyze', 'download_and_merge',
+        'pause_download', 'resume_download', 'stop_download',
+        'clear_video_cache', 'clear_ytdlp_cache', 'clear_all',
+        'clear_terminal', 'copy_terminal', 'copy_video_info',
+        'show_settings', 'show_debug_info', '_show_preview',
+        'toggle_terminal', '_toggle_batch_panel', '_toggle_stub',
+        '_set_stub_mode', '_set_stub_fail', '_run_pending_updates',
+        'on_recommended_double_click', 'on_stream_double_click',
+        'show_combination_details', '_analyze_history_url',
+        '_clear_download_history', '_update_ytdlp',
+    )
+
+    def _vlog_action_state(self):
+        """Short state snapshot to accompany a recorded user action."""
+        try:
+            _ao = getattr(self, 'audio_only_mode', None)
+            _sel = ''
+            _t = getattr(self, 'recommended_tree', None)
+            if _t is not None:
+                _s = _t.selection()
+                if _s:
+                    _v = _t.item(_s[0]).get('values') or []
+                    _sel = ' | '.join(str(x) for x in _v[:3])
+            _vi = getattr(self, 'current_video_info', None) or {}
+            return [
+                'video   : ' + str(_vi.get('id', '-')) + '  '
+                + str(_vi.get('title', ''))[:50],
+                'selected: ' + (_sel or '(nothing)'),
+                'state   : downloading=' + str(getattr(self, '_download_active', False))
+                + '  queue=' + str(len(getattr(self, 'download_queue', []) or []))
+                + '  quality=' + str(getattr(self, 'default_quality', '?'))
+                + '  audio_only=' + str(_ao.get() if _ao else '?')
+                + '  vbr=' + str(getattr(self, 'preferred_video_bitrate', '?'))
+                + '  hls=' + str(getattr(self, 'include_hls_streams', '?')),
+            ]
+        except Exception:
+            return []
+
+    def _vlog_wrap_actions(self):
+        """Replace user-facing handlers with logging wrappers, ONCE.
+
+        Done here rather than by editing every handler: a single call point
+        cannot miss a button, cannot drift as handlers are renamed, and adds
+        no anchor to twenty separate places. It runs BEFORE setup_ui, so the
+        widgets capture the wrapped bound methods rather than the originals.
+
+        The wrapper is transparent - it logs, then returns the original call
+        untouched, so arguments, return values and exceptions all pass
+        through. When verbose logging is off, _vlog returns immediately and
+        the only cost is one attribute lookup per press.
+        """
+        try:
+            for _name in self._VLOG_ACTIONS:
+                _orig = getattr(self, _name, None)
+                if not callable(_orig):
+                    continue
+
+                def _make(nm, fn):
+                    def _wrapped(*a, **k):
+                        try:
+                            self._vlog('ACTION: ' + nm, self._vlog_action_state())
+                        except Exception:
+                            pass
+                        return fn(*a, **k)
+                    _wrapped.__name__ = getattr(fn, '__name__', nm)
+                    return _wrapped
+
+                setattr(self, _name, _make(_name, _orig))
+        except Exception:
+            pass
+
+    def _vlog_redact(self, text):
+        """Strip the query string from any URL before it is written.
+
+        Stream URLs embed the PO token and signature - anyone holding one can
+        download as this user until it expires - and verbose logs get shared.
+        """
+        try:
+            import re as _re
+            return _re.sub(r'(https?://[^\s?"]+)\?[^\s"]*',
+                           lambda m: m.group(1) + '?<redacted>', str(text))
+        except Exception:
+            return str(text)
+
+    def _vlog(self, title, lines=None):
+        """Write one verbose BLOCK to the separate verbose log.
+
+        Deliberately never uses append_terminal_output: that would add a Tk
+        insert, a see() redraw and a fan-out to _output_listeners per line -
+        and the scenario runner times pause_at_percent off that stream.
+        Verbose output has to be free to be noisy without moving when a
+        scenario pauses or making the UI stutter.
+
+        Its own file and its own lock, so it is written DIRECTLY from any
+        thread: no root.after, no main-thread work at all. Blocks rather than
+        lines keep it to one lock acquisition per event.
+        """
+        if not getattr(self, 'verbose_logging', False):
+            return
+        try:
+            with self._verbose_lock:
+                fh = getattr(self, '_verbose_fh', None)
+                if fh is None:
+                    _d = getattr(self, 'ysa_logs_dir', None) or SCRIPT_DIR
+                    if not os.path.isdir(_d):
+                        os.makedirs(_d, exist_ok=True)
+                    _name = ('YSA_VERBOSE_'
+                             + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                             + '.log')
+                    fh = open(os.path.join(_d, _name), 'a', encoding='utf-8',
+                              errors='replace')
+                    self._verbose_fh = fh
+                    fh.write('YSA verbose log - started '
+                             + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                             + '\n' + ('=' * 78) + '\n')
+                # Must match the session log exactly: _session_log_t0, set
+                # with time.monotonic(). The first version read '_log_t0'
+                # with time.time(), so getattr always fell to its default
+                # and every line printed -0.000, which defeats the point.
+                _t0 = getattr(self, '_session_log_t0', None)
+                if _t0 is None:
+                    _t0 = time.monotonic()
+                    self._session_log_t0 = _t0
+                _t = time.monotonic() - _t0
+                fh.write('[' + ('%9.3f' % _t) + '] ' + str(title) + '\n')
+                for _l in (lines or []):
+                    fh.write('              ' + self._vlog_redact(_l) + '\n')
+                fh.flush()
+        except Exception:
+            pass
+
+    def _vlog_close(self):
+        """Close the verbose handle - toggled off, or shutting down."""
+        try:
+            with self._verbose_lock:
+                fh = getattr(self, '_verbose_fh', None)
+                if fh is not None:
+                    fh.write('-- verbose logging ended --\n')
+                    fh.close()
+                self._verbose_fh = None
+        except Exception:
+            self._verbose_fh = None
+
+    def _vlog_environment(self):
+        """One-off snapshot so a verbose log is self-describing."""
+        try:
+            self._vlog('ENVIRONMENT', [
+                'yt-dlp   : ' + str(getattr(self, 'ytdlp_path', '?'))
+                + '  channel=' + str(getattr(self, 'ytdlp_channel', '?')),
+                'ffmpeg   : ' + str(getattr(self, 'ffmpeg_path', '?')),
+                'cache    : ' + str(getattr(self, 'ysa_cache_root', '?')),
+                'state    : ' + str(getattr(self, 'ysa_state_root', '?')),
+                'output   : ' + str(getattr(self, 'download_path', '?')),
+                'bgutil   : running=' + str(getattr(self, '_bgutil_running', '?')),
+                'cookies  : ' + str(getattr(self, '_m_cookies_on', '?')),
+                'hardsub  : ' + str(getattr(self, 'hardsub_encoder', '?'))
+                + '  crf_custom=' + str(getattr(self, 'hardsub_crf_custom', '?'))
+                + '  crf=' + str(getattr(self, 'hardsub_crf', '?')),
+                'reuse_info_json: ' + str(getattr(self, 'reuse_info_json', '?')),
+            ])
+        except Exception:
+            pass
+
+    def _vlog_settings_diff(self, cfg):
+        """Log every config key that changed since the last save.
+
+        One hook catches EVERY settings change regardless of which handler
+        made it - the gap that let a filename-format change pass unrecorded
+        mid-session.
+        """
+        try:
+            _prev = getattr(self, '_vlog_last_cfg', None)
+            self._vlog_last_cfg = dict(cfg)
+            if not getattr(self, 'verbose_logging', False):
+                return
+            if _prev is None:
+                self._vlog('CONFIG (effective)',
+                           [str(k) + ' = ' + repr(cfg[k]) for k in sorted(cfg)])
+                return
+            _ch = [str(k) + ': ' + repr(_prev.get(k)) + '  ->  ' + repr(cfg[k])
+                   for k in sorted(cfg) if _prev.get(k) != cfg[k]]
+            if _ch:
+                self._vlog('CONFIG CHANGED (' + str(len(_ch)) + ')', _ch)
+        except Exception:
+            pass
+
+    def _vlog_recommended_rows(self, why):
+        """Dump the Recommended tab as displayed, plus what produced it.
+
+        Called on every rebuild, so switching from highest to lowest bitrate
+        records both the cause and the resulting formats and sizes.
+        """
+        if not getattr(self, 'verbose_logging', False):
+            return
+        try:
+            _t = getattr(self, 'recommended_tree', None)
+            if _t is None:
+                return
+            _rows = []
+            for _i in _t.get_children():
+                _v = _t.item(_i).get('values') or []
+                _rows.append(' | '.join(str(x) for x in _v))
+            _ao = getattr(self, 'audio_only_mode', None)
+            _ctx = ('video_bitrate=' + str(getattr(self, 'preferred_video_bitrate', 0))
+                    + '  audio_bitrate=' + str(getattr(self, 'preferred_audio_bitrate', 0))
+                    + '  hls=' + str(getattr(self, 'include_hls_streams', False))
+                    + '  audio_only=' + str(_ao.get() if _ao else '?')
+                    + '  lang=' + str(getattr(self, 'preferred_language', '')))
+            _vi = getattr(self, 'current_video_info', None) or {}
+            _fmts = _vi.get('formats') or []
+            self._vlog('RECOMMENDED REBUILT (' + str(why) + ') - '
+                       + str(len(_rows)) + ' rows',
+                       ['video    : ' + str(_vi.get('id', '?')) + '  '
+                        + str(_vi.get('title', ''))[:60],
+                        'duration : ' + str(_vi.get('duration', '?')) + 's'
+                        + '   formats offered: ' + str(len(_fmts)),
+                        'settings : ' + _ctx,
+                        'columns  : quality | video stream | audio stream'
+                        ' | est size | notes']
+                       + _rows)
+        except Exception:
+            pass
+
     def _log_stream_url_lifetime(self, info):
         """Report how long this analysis' stream URLs stay valid. DIAGNOSTIC.
 
@@ -11885,6 +12196,8 @@ Total Streams: {len(self.current_formats)}"""
                     def _download_audio_bg():
                         try:
                             cmd = self._ytdlp_head() + audio_args_bg
+                            self._vlog('YT-DLP SPAWN (audio leg)',
+                                       [' '.join(str(c) for c in cmd)])
                             proc = subprocess.Popen(
                                 cmd,
                                 stdout=subprocess.PIPE,
@@ -13906,6 +14219,38 @@ Total Streams: {len(self.current_formats)}"""
             return []
         return ['-hwaccel', 'auto']
 
+    def _hardsub_crf_value(self):
+        """CRF for a software burn, as a string for the argv.
+
+        23 unless the custom toggle is on - the same constant that was
+        hard-coded before, so nothing changes for an untouched config.
+
+        Clamped to 0-51 because that is x264's real range; outside it ffmpeg
+        simply refuses the encode. 0 is LOSSLESS and can be enormous, and it
+        is one keystroke from 23 ('2'), so an unusual value is announced in
+        the log rather than silently costing twenty minutes and gigabytes.
+        Only the libx264 path uses this; the hardware encoders have their
+        own quality scales and are deliberately untouched.
+        """
+        _crf = 23
+        try:
+            if getattr(self, 'hardsub_crf_custom', False):
+                _crf = int(getattr(self, 'hardsub_crf', 23))
+                if _crf < 0:
+                    _crf = 0
+                elif _crf > 51:
+                    _crf = 51
+                if _crf < 17 or _crf > 30:
+                    self.append_terminal_output(
+                        'Hardsub CRF ' + str(_crf) + ' is outside the usual'
+                        ' 17-30 range'
+                        + (' - 0 is lossless and can be very large.'
+                           if _crf < 17 else ' - expect visible quality loss.')
+                        + '\n', 'warning')
+        except (TypeError, ValueError):
+            _crf = 23
+        return str(_crf)
+
     def _hardsub_codec_args(self, stream_spec='-c:v'):
         """Video-codec argv slice for a subtitle burn (batch 1b).
 
@@ -13929,7 +14274,7 @@ Total Streams: {len(self.current_formats)}"""
             args = [stream_spec, 'h264_amf', '-quality', 'balanced',
                     '-rc', 'cqp', '-qp_i', '23', '-qp_p', '23']
         else:
-            args = [stream_spec, 'libx264', '-crf', '23',
+            args = [stream_spec, 'libx264', '-crf', self._hardsub_crf_value(),
                     '-preset', 'veryfast']
         self.append_terminal_output(
             'Hardsub: encoding with ' + args[1] + '.\n', 'info')
@@ -16119,6 +16464,9 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             self.preferred_video_bitrate = self._cfg_get(cfg, 'preferred_video_bitrate', self.preferred_video_bitrate, int)
             self.include_hls_streams = self._cfg_get(cfg, 'include_hls_streams', False, bool)
             self.reuse_info_json = self._cfg_get(cfg, 'reuse_info_json', True, bool)
+            self.hardsub_crf_custom = self._cfg_get(cfg, 'hardsub_crf_custom', False, bool)
+            self.hardsub_crf = self._cfg_get(cfg, 'hardsub_crf', 23, int)
+            self.verbose_logging = self._cfg_get(cfg, 'verbose_logging', False, bool)
             self.audio_only_mode_default = self._cfg_get(cfg, 'audio_only_mode', self.audio_only_mode_default, bool)
             self.audio_only_format = self._cfg_get(cfg, 'audio_only_format', getattr(self, 'audio_only_format', 'm4a_native'))
             self.audio_opus_naming = self._cfg_get(cfg, 'audio_opus_naming', self.audio_opus_naming, str)
@@ -16219,6 +16567,9 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 'preferred_video_bitrate': self.preferred_video_bitrate,
                 'include_hls_streams': self.include_hls_streams,
                 'reuse_info_json': self.reuse_info_json,
+                'hardsub_crf_custom': self.hardsub_crf_custom,
+                'hardsub_crf': self.hardsub_crf,
+                'verbose_logging': self.verbose_logging,
                 'audio_only_mode': self.audio_only_mode.get() if hasattr(self, 'audio_only_mode') else self.audio_only_mode_default,
                 'audio_only_format': getattr(self, 'audio_only_format', 'm4a'),
                 'audio_opus_naming': getattr(self, 'audio_opus_naming', 'codec'),
@@ -16237,6 +16588,7 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 'window_geometry': getattr(self, 'window_geometry', ''),
                 'window_maximized': getattr(self, 'window_maximized', False),
             }
+            self._vlog_settings_diff(cfg)
             tmp_file = config_file + '.tmp'
             with open(tmp_file, 'w') as f:
                 json.dump(cfg, f, indent=2)
