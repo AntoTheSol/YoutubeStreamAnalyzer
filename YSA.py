@@ -11597,7 +11597,7 @@ Total Streams: {len(self.current_formats)}"""
         except Exception:
             pass
 
-    def _info_json_for_leg(self, video_info, temp_dir):
+    def _info_json_for_leg(self, video_info, temp_dir, tag=''):
         """Path to a reusable info JSON for this download, or None.
 
         A merge costs THREE yt-dlp extractions - the analysis plus one per
@@ -11634,7 +11634,10 @@ Total Streams: {len(self.current_formats)}"""
                     'Stream URLs expire within 15 minutes - re-extracting'
                     ' rather than reusing the analysis.\n', 'info')
                 return None
-            _p = os.path.join(temp_dir, 'ysa_info.json')
+            # Per-leg filename: the video and audio legs run CONCURRENTLY,
+            # so a shared path would let two threads write the same file
+            # at once and one could read a half-written dict.
+            _p = os.path.join(temp_dir, 'ysa_info' + str(tag or '') + '.json')
             with open(_p, 'w', encoding='utf-8') as _fh:
                 json.dump(video_info, _fh)
             return _p
@@ -12255,8 +12258,25 @@ Total Streams: {len(self.current_formats)}"""
                     video_args.extend(self.get_ytdlp_dns_args())
                     if self.yt_dlp_cache_dir:
                         video_args.extend(['--cache-dir', self.yt_dlp_cache_dir])
-                    video_args.append(url)
-                    self.run_ytdlp_command_with_terminal(video_args, capture_output=False, timeout=7200)
+                    # Reuse the analysis rather than extracting a third time.
+                    # A failure disables reuse for the rest of this download
+                    # and re-raises, so the existing retry loop extracts
+                    # normally instead of repeating the same failure.
+                    _vj = self._info_json_for_leg(video_info, temp_dir, '_video')
+                    if _vj:
+                        video_args.extend(['--load-info-json', _vj])
+                    else:
+                        video_args.append(url)
+                    try:
+                        self.run_ytdlp_command_with_terminal(video_args, capture_output=False, timeout=7200)
+                    except Exception:
+                        if _vj:
+                            self._info_json_disabled = True
+                            self.append_terminal_output(
+                                'Reusing the analysis failed for the video leg'
+                                ' - falling back to a fresh extraction.\n',
+                                'warning')
+                        raise
 
                     # Wait for audio thread to finish
                     audio_thread.join(timeout=7210)
