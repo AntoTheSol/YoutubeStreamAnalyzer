@@ -1325,6 +1325,19 @@ class YouTubeStreamAnalyzerGUI:
         # Audio stream preference
         self.preferred_audio_bitrate = 0     # 0 = highest available
         self.preferred_video_bitrate = 0     # 0 = highest available per resolution
+        # Codec family to prefer at a given resolution, tried in order with
+        # automatic fallback to the next family, then to the full pool if
+        # none match. 'compatible' (H.264 first) is the default: H.264 is
+        # the one codec every device and editor handles, and it is also the
+        # cheapest to DECODE - this app burns subtitles with libx264 in
+        # software, and AV1 decodes far slower there. 'any' reproduces the
+        # exact pre-existing codec-blind behaviour.
+        self.video_codec_pref = 'compatible'   # compatible|balanced|smallest|any
+        # Explicit selection MODE, replacing the old '0 = highest, 1 = lowest,
+        # N = cap' overload of preferred_video_bitrate. That field is now
+        # read ONLY when mode == 'cap'; 'highest' and 'lowest' no longer
+        # depend on which number happens to be stored there.
+        self.video_bitrate_mode = 'highest'    # highest|lowest|cap
         # HLS/m3u8 video streams are hidden from Recommended by default. Their
         # FILESIZE/TBR are advertised manifest figures, not measured: yt-dlp
         # prints them with '~' and marks them Untested, and they can overstate
@@ -1343,6 +1356,18 @@ class YouTubeStreamAnalyzerGUI:
         # config encodes the same as it always did. The number is remembered
         # while the toggle is off so it survives untick/retick.
         self.hardsub_crf_custom = False
+        # Playlist/channel batching. Scoped ENTIRELY to that one worker -
+        # nothing about a single-video download reads any of these.
+        # Random pacing is the default, not 'off': the whole point of this
+        # feature is a channel-sized burst of extractions looking less
+        # automated, and an unpaced default would silently undo that for
+        # anyone who never opens this setting.
+        self.playlist_pace_mode = 'random'   # random | fixed | off
+        self.playlist_pace_min = 2
+        self.playlist_pace_max = 5
+        self.playlist_pace_fixed = 3
+        self.playlist_batch_size = 50
+        self.playlist_direction = 'newest'   # newest | oldest
         self.hardsub_crf = 23
         # Verbose diagnostics: its own FILE and its own LOCK, so it never
         # touches the terminal widget, _output_listeners or the main thread.
@@ -4714,17 +4739,36 @@ class YouTubeStreamAnalyzerGUI:
                 stderr=subprocess.DEVNULL,
                 creationflags=CREATE_NO_WINDOW)
             self._bgutil_process = proc
-            time.sleep(2)
-            if self._bgutil_check_server():
+            # A single fixed sleep raced the server's real startup time -
+            # worse right after an update or under load, when the false
+            # 'not reachable' verdict once led straight to a needless npm
+            # install attempt. Poll instead: check twice a second for up to
+            # 5s, returning the instant it answers rather than waiting out
+            # the full window every time.
+            _deadline = time.time() + 5.0
+            while time.time() < _deadline:
+                if self._bgutil_check_server():
+                    self.append_terminal_output(
+                        'bgutil: server started (PID ' + str(proc.pid) + ').\n',
+                        'success')
+                    self._bgutil_running = True
+                    return True
+                if proc.poll() is not None:
+                    break  # the process already exited - no point polling further
+                time.sleep(0.5)
+            # Node was already located to build this command line, so blaming
+            # it here was always wrong when node_exe was truthy - the message
+            # sent a working install on a pointless detour to Settings.
+            if node_exe:
                 self.append_terminal_output(
-                    'bgutil: server started (PID ' + str(proc.pid) + ').\n', 'success')
-                self._bgutil_running = True
-                return True
+                    'bgutil: server launched but did not answer within 5s.\n'
+                    'bgutil: it may still be starting - try again, or check for'
+                    ' another process already using the port.\n', 'warning')
             else:
                 self.append_terminal_output(
                     'bgutil: server launched but not reachable.\n'
                     'bgutil: Is Node.js 20+ installed? (nodejs.org)\n', 'warning')
-                return False
+            return False
         except FileNotFoundError:
             self.append_terminal_output(
                 'bgutil: Node.js not found - install from nodejs.org\n', 'warning')
@@ -7377,7 +7421,7 @@ class YouTubeStreamAnalyzerGUI:
             if upload_date != 'Unknown' and len(upload_date) == 8:
                 upload_date = upload_date[:4] + "-" + upload_date[4:6] + "-" + upload_date[6:]
 
-            _info_fg = '#e0e0e0' if self.dark_mode else 'black'
+            _info_fg = '#cccccc' if self.dark_mode else 'black'
             self.info_labels['title'].config(text=title, foreground=_info_fg)
             self.info_labels['uploader'].config(text=uploader, foreground=_info_fg)
             self.info_labels['duration'].config(text=duration, foreground=_info_fg)
@@ -7744,26 +7788,68 @@ class YouTubeStreamAnalyzerGUI:
         if not suppress_auto_download:
             self._auto_download_best_quality()
 
+    _VIDEO_CODEC_ORDERS = {
+        'compatible': ('h264', 'vp9', 'av1'),
+        'balanced':   ('vp9', 'av1', 'h264'),
+        'smallest':   ('av1', 'vp9', 'h264'),
+    }
+
+    def _video_codec_family(self, fmt):
+        """'h264' | 'vp9' | 'av1' | 'other', read from a format dict's vcodec.
+
+        Matches every vcodec prefix seen in this project's own field dumps:
+        avc1.* (H.264), vp9 / vp09.* (VP9), av01.* (AV1).
+        """
+        vc = str((fmt or {}).get('vcodec') or '').lower()
+        if vc.startswith('avc1') or vc.startswith('h264'):
+            return 'h264'
+        if vc.startswith('vp9') or vc.startswith('vp09'):
+            return 'vp9'
+        if vc.startswith('av01') or vc.startswith('av1'):
+            return 'av1'
+        return 'other'
+
     def select_best_video_stream(self, candidates):
-        """Choose the best video stream from a list of streams at the same resolution.
-        Respects preferred_video_bitrate: picks the highest-bitrate stream whose vbr
-        (or tbr as fallback) is at or below the cap.  When no stream qualifies, or the
-        cap is 0 (disabled), returns the highest-bitrate stream in the pool."""
+        """Choose the best video stream from a list of streams at the same
+        resolution, in two independent, layered steps.
+
+        1. CODEC: video_codec_pref narrows the pool to the first preferred
+           codec family that actually has a candidate here, with automatic
+           fallback down its order - and if NONE of the ordered families are
+           present (e.g. every candidate is an unclassified codec), the pool
+           is left unrestricted rather than emptied. 'any' skips this step
+           entirely, reproducing the exact prior codec-blind behaviour.
+
+        2. BITRATE: video_bitrate_mode chooses within whatever the codec step
+           left - 'highest' or 'lowest' by measured bitrate, or 'cap' at
+           preferred_video_bitrate (that field is READ only in cap mode; it
+           no longer doubles as a highest/lowest switch). Unknown bitrates
+           are still ranked last and never excluded outright, exactly as
+           before this refactor.
+        """
         if not candidates:
             return None
+
+        pref = getattr(self, 'video_codec_pref', 'compatible')
+        order = self._VIDEO_CODEC_ORDERS.get(pref)
+        if order:
+            for family in order:
+                fam = [c for c in candidates if self._video_codec_family(c) == family]
+                if fam:
+                    candidates = fam
+                    break
+            # No candidate matched ANY family in the order: candidates is
+            # still the full original pool here, deliberately.
+
+        mode = getattr(self, 'video_bitrate_mode', 'highest')
         limit = getattr(self, 'preferred_video_bitrate', 0)
 
         def _vbr(s):
             """Bitrate in kbps, or None when the source did not report one.
 
-            This used to end in "or 0", which made an UNMEASURED stream
-            look like the worst one in the pool. A cap of 1 then selected
-            exactly those unmeasured formats while a cap of 0 ignored them
-            entirely - which is how "maximum bitrate" ended up returning
-            something smaller than "minimum bitrate". Unknown is now
-            unknown: ranked last, never mistaken for lowest, and never
-            excluded outright so a pool with no bitrate data still
-            resolves to a real stream.
+            Unknown is ranked last, never mistaken for lowest, and never
+            excluded outright so a pool with no bitrate data still resolves
+            to a real stream.
             """
             v = s.get('vbr') or s.get('tbr')
             try:
@@ -7776,16 +7862,19 @@ class YouTubeStreamAnalyzerGUI:
         def _key(s):
             return _vbr(s) or 0.0
 
-        if limit and limit > 0:
+        if mode == 'lowest':
+            if known:
+                return min(known, key=_key)
+            return candidates[0]
+        if mode == 'cap' and limit and limit > 0:
             under = [s for s in known if _vbr(s) <= limit]
             if under:
                 return max(under, key=_key)
             if known:
-                # Everything measured exceeds the cap - take the lowest
-                # measured stream, the closest to what was asked for.
                 return min(known, key=_key)
-            # Nothing carries a bitrate at all: fall back rather than fail.
             return candidates[0]
+        # 'highest', or 'cap' with no usable limit set - same fallback the
+        # original code used for a disabled cap.
         if known:
             return max(known, key=_key)
         return candidates[0]
@@ -8374,7 +8463,9 @@ Total Streams: {len(self.current_formats)}"""
         dialog.resizable(True, True)
         dialog.minsize(800, 960)
         dialog.transient(self.root)
-        dialog.grab_set()
+        # No grab_set(): the main window stays fully usable while Settings
+        # is open, by request - transient() alone still keeps this window
+        # associated with (grouped/stacked above) the main one.
 
         notebook = ttk.Notebook(dialog)
         # btn_frame is packed first with side=BOTTOM so it stays pinned below
@@ -8988,6 +9079,50 @@ Total Streams: {len(self.current_formats)}"""
                   font=('Arial', 8), foreground='gray').grid(
             row=17, column=0, columnspan=4, sticky=tk.W, padx=42, pady=(0, 4))
 
+        # row 18 was left free by the earlier cache-tab/downloads-tab grid
+        # fixes. Label -> internal-value maps live here so both the widget
+        # construction below and the save handler further down (same
+        # enclosing function, so it is in closure scope) share one source
+        # of truth for the display text.
+        _CODEC_LABELS = {
+            'compatible': 'Most compatible',
+            'balanced': 'Balanced',
+            'smallest': 'Smallest files',
+            'any': 'Any',
+        }
+        _CODEC_VALUES = {v: k for k, v in _CODEC_LABELS.items()}
+        ttk.Label(tab_dl, text="Preferred video codec:").grid(
+            row=18, column=0, sticky=tk.W, padx=8, pady=(4, 2))
+        video_codec_var = tk.StringVar(
+            value=_CODEC_LABELS.get(getattr(self, 'video_codec_pref', 'compatible'),
+                                    _CODEC_LABELS['compatible']))
+        def _apply_codec_live(_event=None):
+            # Live-scoped to codec + bitrate only, on request: writing every
+            # Settings control immediately would mean touching dozens of
+            # widgets with real interdependencies elsewhere in this dialog -
+            # a much bigger, riskier change than what was actually asked
+            # for. This updates self.video_codec_pref in memory and
+            # refreshes the Recommended tab immediately; Save still governs
+            # what survives to the next launch (self._cfg_get reads back
+            # whatever was last SAVED, not whatever is live in this dialog).
+            self.video_codec_pref = _CODEC_VALUES.get(
+                video_codec_var.get(), 'compatible')
+            if getattr(self, 'current_video_info', None):
+                self._populate_recommended_combinations(suppress_auto_download=True)
+
+        _video_codec_combo = ttk.Combobox(
+            tab_dl, textvariable=video_codec_var,
+            values=list(_CODEC_LABELS.values()), state='readonly', width=16)
+        _video_codec_combo.grid(row=18, column=1, columnspan=2, sticky=tk.W,
+                                padx=8, pady=(4, 2))
+        _video_codec_combo.bind('<<ComboboxSelected>>', _apply_codec_live)
+        ttk.Label(tab_dl,
+                  text="'Most compatible' (H.264 first) is the default - this app\n"
+                       "burns subtitles in software, and AV1 decodes far slower\n"
+                       "there. 'Any' restores plain bitrate-only selection.",
+                  font=('Arial', 8), foreground='gray').grid(
+            row=18, column=3, sticky=tk.W, padx=4)
+
         # row 19, not 15: at 15 this label was drawn into the same cell as
         # the "Stream Bitrate:" section header (Tk stacks silently), while
         # its own entry sat four rows lower at 19 with nothing beside it.
@@ -8995,18 +9130,22 @@ Total Streams: {len(self.current_formats)}"""
         ttk.Label(tab_dl, text="Max audio bitrate (kbps):").grid(
             row=19, column=0, sticky=tk.W, padx=8, pady=(2, 2))
         audio_bitrate_var = tk.StringVar(value=str(getattr(self, 'preferred_audio_bitrate', 0)))
-        audio_bitrate_entry = ttk.Entry(tab_dl, textvariable=audio_bitrate_var, width=8)
-        audio_bitrate_entry.grid(row=19, column=1, sticky=tk.W, padx=8, pady=(2, 2))
-        _abr_btn_frame = ttk.Frame(tab_dl)
-        _abr_btn_frame.grid(row=19, column=2, sticky=tk.W, padx=(0, 4), pady=(2, 2))
-        ttk.Button(_abr_btn_frame, text="Highest",
+        # Packed together inside one private frame - same reason and same
+        # fix as the video bitrate row and the CRF row above it: tab_dl
+        # column 1 is widened by a Combobox on other rows, and only a
+        # private frame's own pack-based spacing is immune to that.
+        _abr_row = ttk.Frame(tab_dl)
+        _abr_row.grid(row=19, column=1, columnspan=2, sticky=tk.W, padx=8, pady=(2, 2))
+        audio_bitrate_entry = ttk.Entry(_abr_row, textvariable=audio_bitrate_var, width=8)
+        audio_bitrate_entry.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(_abr_row, text="Highest",
                    command=lambda: audio_bitrate_var.set('0')).pack(side=tk.LEFT, padx=(0, 2))
-        ttk.Button(_abr_btn_frame, text="Lowest",
+        ttk.Button(_abr_row, text="Lowest",
                    command=lambda: audio_bitrate_var.set('1')).pack(side=tk.LEFT)
         ttk.Label(tab_dl, text="(0 = highest available)", font=('Arial', 8),
                   foreground="gray").grid(row=19, column=3, sticky=tk.W, padx=4)
 
-        ttk.Label(tab_dl, text="Max video bitrate (kbps):").grid(
+        ttk.Label(tab_dl, text="Video bitrate:").grid(
             row=20, column=0, sticky=tk.W, padx=8, pady=(2, 2))
         video_bitrate_var = tk.StringVar(value=str(getattr(self, 'preferred_video_bitrate', 0)))
         hardsub_crf_custom_var = tk.BooleanVar(
@@ -9042,16 +9181,63 @@ Total Streams: {len(self.current_formats)}"""
                        "Below 17 or above 30 is unusual; 0 is lossless and huge.",
                   font=('Arial', 8), foreground='gray').pack(
             side=tk.TOP, anchor=tk.W, padx=(20, 0))
-        video_bitrate_entry = ttk.Entry(tab_dl, textvariable=video_bitrate_var, width=8)
-        video_bitrate_entry.grid(row=20, column=1, sticky=tk.W, padx=8, pady=(2, 2))
-        _vbr_btn_frame = ttk.Frame(tab_dl)
-        _vbr_btn_frame.grid(row=20, column=2, sticky=tk.W, padx=(0, 4), pady=(2, 2))
-        ttk.Button(_vbr_btn_frame, text="Highest",
-                   command=lambda: video_bitrate_var.set('0')).pack(side=tk.LEFT, padx=(0, 2))
-        ttk.Button(_vbr_btn_frame, text="Lowest",
-                   command=lambda: video_bitrate_var.set('1')).pack(side=tk.LEFT)
-        ttk.Label(tab_dl, text="(0 = highest available - affects size display)", font=('Arial', 8),
-                  foreground="gray").grid(row=20, column=3, sticky=tk.W, padx=4)
+        # The confusing part was a dedicated "Cap" BUTTON getting mis-clicked
+        # in a row too narrow for three buttons - not the number box itself.
+        # The box stays, always visible and always editable, showing 0/1
+        # after a preset so it reads back what Highest/Lowest mean; typing
+        # into it directly is what now means "use my own number", so there
+        # is no third button competing for the row's width.
+        video_bitrate_mode_var = tk.StringVar(
+            value=getattr(self, 'video_bitrate_mode', 'highest'))
+        # Entry and buttons are packed together inside ONE frame rather than
+        # gridded into separate columns: tab_dl column 1 also holds a
+        # Combobox on other rows with no fixed width, so Tk widened that
+        # whole column to fit it, leaving dead space between this narrow
+        # entry and the buttons that padx alone cannot close. A private
+        # frame keeps its internal spacing immune to that, same fix
+        # already used for the CRF row above.
+        _vbr_row = ttk.Frame(tab_dl)
+        _vbr_row.grid(row=20, column=1, columnspan=2, sticky=tk.W, padx=8, pady=(2, 2))
+        video_bitrate_entry = ttk.Entry(_vbr_row, textvariable=video_bitrate_var, width=8)
+        video_bitrate_entry.pack(side=tk.LEFT, padx=(0, 6))
+
+        def _apply_bitrate_live():
+            # Same live-preview scope as the codec box: updates the two
+            # in-memory attributes select_best_video_stream actually reads
+            # and refreshes Recommended immediately. Save still governs
+            # what is written to disk for next launch.
+            try:
+                self.preferred_video_bitrate = max(0, int(video_bitrate_var.get()))
+            except ValueError:
+                pass
+            self.video_bitrate_mode = video_bitrate_mode_var.get()
+            if getattr(self, 'current_video_info', None):
+                self._populate_recommended_combinations(suppress_auto_download=True)
+
+        def _vbr_typed(_event=None):
+            # KeyRelease only fires on actual keystrokes, never on the
+            # button handlers' own .set() calls below - so a preset button
+            # can safely rewrite the box without this immediately undoing it.
+            video_bitrate_mode_var.set('cap')
+            _apply_bitrate_live()
+
+        video_bitrate_entry.bind('<KeyRelease>', _vbr_typed)
+
+        def _set_vbr_preset(mode, shown):
+            video_bitrate_mode_var.set(mode)
+            video_bitrate_var.set(shown)
+            _apply_bitrate_live()
+
+        ttk.Button(_vbr_row, text="Highest",
+                   command=lambda: _set_vbr_preset('highest', '0')
+                   ).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(_vbr_row, text="Lowest",
+                   command=lambda: _set_vbr_preset('lowest', '1')
+                   ).pack(side=tk.LEFT)
+        ttk.Label(tab_dl,
+                  text="Highest/Lowest, or type your own ceiling (kbps).",
+                  font=('Arial', 8), foreground="gray").grid(
+            row=20, column=3, sticky=tk.W, padx=4)
 
         ttk.Separator(tab_dl, orient=tk.HORIZONTAL).grid(
             row=21, column=0, columnspan=3, sticky=(tk.W, tk.E), padx=8, pady=8)
@@ -10002,6 +10188,67 @@ Total Streams: {len(self.current_formats)}"""
             row=3, column=0, columnspan=3, sticky=tk.W, padx=14, pady=(16, 0))
 
 
+        _pl_frame = ttk.LabelFrame(tab_dl, text="Playlist / channel downloads",
+                                   padding=8)
+        _pl_frame.grid(row=46, column=0, columnspan=4, sticky=tk.W, padx=8, pady=(12, 8))
+
+        ttk.Label(_pl_frame, text="Delay between videos:").grid(
+            row=0, column=0, sticky=tk.W, pady=(0, 2))
+        playlist_pace_mode_var = tk.StringVar(
+            value={'random': 'Randomized', 'fixed': 'Fixed', 'off': 'Off'}.get(
+                getattr(self, 'playlist_pace_mode', 'random'), 'Randomized'))
+        ttk.Combobox(_pl_frame, textvariable=playlist_pace_mode_var,
+                     values=('Randomized', 'Fixed', 'Off'), state='readonly',
+                     width=12).grid(row=0, column=1, sticky=tk.W, padx=(6, 0), pady=(0, 2))
+
+        ttk.Label(_pl_frame, text="   Random range (sec):").grid(
+            row=1, column=0, sticky=tk.W)
+        playlist_pace_min_var = tk.StringVar(value=str(getattr(self, 'playlist_pace_min', 2)))
+        playlist_pace_max_var = tk.StringVar(value=str(getattr(self, 'playlist_pace_max', 5)))
+        _pl_range_row = ttk.Frame(_pl_frame)
+        _pl_range_row.grid(row=1, column=1, sticky=tk.W, padx=(6, 0))
+        _pl_min_entry = ttk.Entry(_pl_range_row, textvariable=playlist_pace_min_var, width=5)
+        _pl_min_entry.pack(side=tk.LEFT)
+        ttk.Label(_pl_range_row, text=" to ").pack(side=tk.LEFT)
+        _pl_max_entry = ttk.Entry(_pl_range_row, textvariable=playlist_pace_max_var, width=5)
+        _pl_max_entry.pack(side=tk.LEFT)
+
+        ttk.Label(_pl_frame, text="   Fixed delay (sec):").grid(
+            row=2, column=0, sticky=tk.W)
+        playlist_pace_fixed_var = tk.StringVar(value=str(getattr(self, 'playlist_pace_fixed', 3)))
+        _pl_fixed_entry = ttk.Entry(_pl_frame, textvariable=playlist_pace_fixed_var, width=5)
+        _pl_fixed_entry.grid(row=2, column=1, sticky=tk.W, padx=(6, 0))
+
+        def _sync_pl_pace_entries(*_a):
+            _mode = playlist_pace_mode_var.get()
+            _pl_min_entry.config(state=('normal' if _mode == 'Randomized' else 'disabled'))
+            _pl_max_entry.config(state=('normal' if _mode == 'Randomized' else 'disabled'))
+            _pl_fixed_entry.config(state=('normal' if _mode == 'Fixed' else 'disabled'))
+
+        playlist_pace_mode_var.trace_add('write', _sync_pl_pace_entries)
+        _sync_pl_pace_entries()
+
+        ttk.Label(_pl_frame, text="Default batch size:").grid(
+            row=3, column=0, sticky=tk.W, pady=(6, 2))
+        playlist_batch_var = tk.StringVar(value=str(getattr(self, 'playlist_batch_size', 50)))
+        ttk.Entry(_pl_frame, textvariable=playlist_batch_var, width=6).grid(
+            row=3, column=1, sticky=tk.W, padx=(6, 0), pady=(6, 2))
+
+        ttk.Label(_pl_frame, text="Default order:").grid(
+            row=4, column=0, sticky=tk.W)
+        playlist_direction_var = tk.StringVar(
+            value='Newest first' if getattr(self, 'playlist_direction', 'newest') == 'newest'
+            else 'Oldest first')
+        ttk.Combobox(_pl_frame, textvariable=playlist_direction_var,
+                     values=('Newest first', 'Oldest first'), state='readonly',
+                     width=12).grid(row=4, column=1, sticky=tk.W, padx=(6, 0))
+
+        ttk.Label(_pl_frame,
+                  text="Applies only when a pasted URL is a playlist or channel.\n"
+                       "Single-video downloads are never affected by this section.",
+                  font=('Arial', 8), foreground='gray', justify=tk.LEFT).grid(
+            row=5, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+
         # ── Register tabs in display order ────────────────────────────────
         notebook.add(_tab_dl_outer, text="Downloads")
         notebook.add(tab_audio,  text="Audio")
@@ -10104,8 +10351,30 @@ Total Streams: {len(self.current_formats)}"""
                 self.preferred_video_bitrate = max(0, int(video_bitrate_var.get()))
             except ValueError:
                 self.preferred_video_bitrate = 0
+            self.video_bitrate_mode = video_bitrate_mode_var.get()
+            self.video_codec_pref = _CODEC_VALUES.get(video_codec_var.get(), 'compatible')
             self.include_hls_streams = include_hls_var.get()
             self.hardsub_crf_custom = hardsub_crf_custom_var.get()
+            self.playlist_pace_mode = {'Randomized': 'random', 'Fixed': 'fixed',
+                                       'Off': 'off'}.get(playlist_pace_mode_var.get(), 'random')
+            try:
+                self.playlist_pace_min = max(0, int(playlist_pace_min_var.get()))
+            except ValueError:
+                self.playlist_pace_min = 2
+            try:
+                self.playlist_pace_max = max(self.playlist_pace_min, int(playlist_pace_max_var.get()))
+            except ValueError:
+                self.playlist_pace_max = max(self.playlist_pace_min, 5)
+            try:
+                self.playlist_pace_fixed = max(0, int(playlist_pace_fixed_var.get()))
+            except ValueError:
+                self.playlist_pace_fixed = 3
+            try:
+                self.playlist_batch_size = max(1, int(playlist_batch_var.get()))
+            except ValueError:
+                self.playlist_batch_size = 50
+            self.playlist_direction = ('newest' if playlist_direction_var.get() == 'Newest first'
+                                       else 'oldest')
             try:
                 self.hardsub_crf = max(0, min(51, int(hardsub_crf_var.get())))
             except ValueError:
@@ -11843,12 +12112,30 @@ Total Streams: {len(self.current_formats)}"""
             _t = getattr(self, 'recommended_tree', None)
             if _t is None:
                 return
+            def _codec_tag(_video_stream_text):
+                # A quick, direct answer to "did codec preference actually
+                # do what I set it to?" - the display text already names
+                # the codec (e.g. "mp4 av01.0.08M (399)"), this just makes
+                # it a one-glance tag instead of something to decode by eye.
+                _t2 = str(_video_stream_text).lower()
+                if 'avc1' in _t2 or 'h264' in _t2:
+                    return '[H264]'
+                if 'vp09' in _t2 or 'vp9' in _t2:
+                    return '[VP9]'
+                if 'av01' in _t2 or 'av1' in _t2:
+                    return '[AV1]'
+                return ''
+
             _rows = []
             for _i in _t.get_children():
-                _v = _t.item(_i).get('values') or []
-                _rows.append(' | '.join(str(x) for x in _v))
+                _v = list(_t.item(_i).get('values') or [])
+                _tag = _codec_tag(_v[1]) if len(_v) > 1 else ''
+                _rows.append(' | '.join(str(x) for x in _v)
+                            + (('  ' + _tag) if _tag else ''))
             _ao = getattr(self, 'audio_only_mode', None)
-            _ctx = ('video_bitrate=' + str(getattr(self, 'preferred_video_bitrate', 0))
+            _ctx = ('video_codec_pref=' + str(getattr(self, 'video_codec_pref', '?'))
+                    + '  video_bitrate_mode=' + str(getattr(self, 'video_bitrate_mode', '?'))
+                    + '  video_bitrate=' + str(getattr(self, 'preferred_video_bitrate', 0))
                     + '  audio_bitrate=' + str(getattr(self, 'preferred_audio_bitrate', 0))
                     + '  hls=' + str(getattr(self, 'include_hls_streams', False))
                     + '  audio_only=' + str(_ao.get() if _ao else '?')
@@ -12707,13 +12994,26 @@ Total Streams: {len(self.current_formats)}"""
                 # progress lines we can parse to show a frame counter.
                 # For copy-codec paths keep -loglevel error (no overhead).
                 if _do_hardsub:
-                    # -hwaccel auto lets FFmpeg use GPU decoding where available
-                    # (DXVA2/D3D11VA on Windows, NVDEC on NVIDIA, etc.).
-                    # FFmpeg silently falls back to CPU if no hardware decoder is
-                    # found - this flag is always safe to pass.
-                    # Apply ONLY to hardsub; stream-copy paths do no decoding.
+                    # -threads 0 lets FFmpeg auto-pick the thread count; always
+                    # safe, unrelated to decode mode.
+                    #
+                    # -hwaccel auto is deliberately NOT re-added here.
+                    # _hardsub_input_args() already decided whether hardware
+                    # decode belongs in this command - that decision is
+                    # already present in merge_cmd[2:] from construction
+                    # above. This block used to override it unconditionally,
+                    # forcing GPU decode even when hardsub_encoder is
+                    # 'libx264' (meant to be a FULLY software pipeline, per
+                    # _hardsub_input_args()'s own docstring). Hardware decode
+                    # feeding a CPU-only subtitles filter, combined with an
+                    # output-level -to trim, produced "No filtered frames for
+                    # output stream" and FFmpeg exit -22 on a clipped hardsub
+                    # burn - clip alone and hardsub alone both worked; only
+                    # the combination, forced through a decode mode the user
+                    # never chose, failed. Respecting the earlier decision
+                    # fixes that without touching clip timing, seek
+                    # placement, or the (already correct) A/V-sync design.
                     merge_cmd = [self.ffmpeg_path, '-y',
-                                 '-hwaccel', 'auto',
                                  '-threads', '0'] + merge_cmd[2:]
                     merge_cmd += ['-movflags', '+faststart',
                                   '-loglevel', 'warning',
@@ -13644,7 +13944,7 @@ Total Streams: {len(self.current_formats)}"""
         """Create and return one queue row Frame for the given entry/index.
         Extracted so both full-rebuild and incremental-append can share it."""
         _dm     = getattr(self, 'dark_mode', False)
-        _row_bg = "#2b2b2b" if _dm else "SystemButtonFace"
+        _row_bg = "#1e1e1e" if _dm else "SystemButtonFace"
         _dim_fg = "#888888" if _dm else "#666666"
         _rm_fg  = "#f44336" if _dm else "#cc2222"
         _arr_fg = "#aaaaaa" if _dm else "#555555"
@@ -13965,9 +14265,9 @@ Total Streams: {len(self.current_formats)}"""
 
             # Content
             _dm = getattr(self, 'dark_mode', False)
-            _bg = '#2b2b2b' if _dm else '#fff0f0'
+            _bg = '#1e1e1e' if _dm else '#fff0f0'
             _fg = '#ff8080' if _dm else '#cc0000'
-            _body_fg = '#eeeeee' if _dm else '#333333'
+            _body_fg = '#cccccc' if _dm else '#333333'
             toast.configure(bg=_bg)
 
             tk.Label(toast, text='\u26a0 ' + title, font=('Arial', 11, 'bold'),
@@ -15357,8 +15657,8 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             ew.title('Preview')
             ew.resizable(False, False)
             ew.attributes('-topmost', True)
-            bg = '#2d2d2d' if getattr(self, 'dark_mode', False) else '#fff5cc'
-            fg = '#eeeeee' if getattr(self, 'dark_mode', False) else '#333333'
+            bg = '#1e1e1e' if getattr(self, 'dark_mode', False) else '#fff5cc'
+            fg = '#cccccc' if getattr(self, 'dark_mode', False) else '#333333'
             ew.configure(background=bg)
             lbl = tk.Label(ew, text=message + '\n\nClick anywhere to close.',
                            background=bg, foreground=fg,
@@ -16482,9 +16782,37 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             self.subtitle_lang = self._cfg_get(cfg, 'subtitle_lang', self.subtitle_lang)
             self.preferred_audio_bitrate = self._cfg_get(cfg, 'preferred_audio_bitrate', self.preferred_audio_bitrate, int)
             self.preferred_video_bitrate = self._cfg_get(cfg, 'preferred_video_bitrate', self.preferred_video_bitrate, int)
+            self.video_codec_pref = self._cfg_get(cfg, 'video_codec_pref', 'compatible', str)
+            # video_bitrate_mode migration: a config saved before this setting
+            # existed has no key for it at all, which cfg.get() distinguishes
+            # from every real value - that is the ONE thing that tells 'never
+            # configured' apart from 'configured as highest'. A raw cfg.get()
+            # is used deliberately instead of _cfg_get(), which cannot make
+            # that distinction (its literal-default rule collapses both cases
+            # to the same result).
+            _vbm_raw = cfg.get('video_bitrate_mode')
+            # 'cap' is a legitimate, reachable mode again: typing a custom
+            # number into the bitrate box sets it directly (see the
+            # Settings UI). It is no longer a dedicated, mis-clickable
+            # button - only the CONFUSING CONTROL was retired, not the
+            # capability, so a saved cap must be honoured, not overwritten.
+            if _vbm_raw in ('highest', 'lowest', 'cap'):
+                self.video_bitrate_mode = _vbm_raw
+            elif self.preferred_video_bitrate == 1:
+                self.video_bitrate_mode = 'lowest'
+            elif self.preferred_video_bitrate not in (0, 1):
+                self.video_bitrate_mode = 'cap'
+            else:
+                self.video_bitrate_mode = 'highest'
             self.include_hls_streams = self._cfg_get(cfg, 'include_hls_streams', False, bool)
             self.reuse_info_json = self._cfg_get(cfg, 'reuse_info_json', True, bool)
             self.hardsub_crf_custom = self._cfg_get(cfg, 'hardsub_crf_custom', False, bool)
+            self.playlist_pace_mode = self._cfg_get(cfg, 'playlist_pace_mode', 'random', str)
+            self.playlist_pace_min = self._cfg_get(cfg, 'playlist_pace_min', 2, int)
+            self.playlist_pace_max = self._cfg_get(cfg, 'playlist_pace_max', 5, int)
+            self.playlist_pace_fixed = self._cfg_get(cfg, 'playlist_pace_fixed', 3, int)
+            self.playlist_batch_size = self._cfg_get(cfg, 'playlist_batch_size', 50, int)
+            self.playlist_direction = self._cfg_get(cfg, 'playlist_direction', 'newest', str)
             self.hardsub_crf = self._cfg_get(cfg, 'hardsub_crf', 23, int)
             self.verbose_logging = self._cfg_get(cfg, 'verbose_logging', False, bool)
             self.audio_only_mode_default = self._cfg_get(cfg, 'audio_only_mode', self.audio_only_mode_default, bool)
@@ -16585,9 +16913,17 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 'subtitle_lang': self.subtitle_lang,
                 'preferred_audio_bitrate': self.preferred_audio_bitrate,
                 'preferred_video_bitrate': self.preferred_video_bitrate,
+                'video_codec_pref': self.video_codec_pref,
+                'video_bitrate_mode': self.video_bitrate_mode,
                 'include_hls_streams': self.include_hls_streams,
                 'reuse_info_json': self.reuse_info_json,
                 'hardsub_crf_custom': self.hardsub_crf_custom,
+                'playlist_pace_mode': self.playlist_pace_mode,
+                'playlist_pace_min': self.playlist_pace_min,
+                'playlist_pace_max': self.playlist_pace_max,
+                'playlist_pace_fixed': self.playlist_pace_fixed,
+                'playlist_batch_size': self.playlist_batch_size,
+                'playlist_direction': self.playlist_direction,
                 'hardsub_crf': self.hardsub_crf,
                 'verbose_logging': self.verbose_logging,
                 'audio_only_mode': self.audio_only_mode.get() if hasattr(self, 'audio_only_mode') else self.audio_only_mode_default,
@@ -17259,11 +17595,26 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             pass
 
     def _run_pending_updates(self):
-        """Triggered by the Update Now button - runs whichever tools need updating."""
+        """Triggered by the Update Now button - runs whichever tools need updating.
+
+        A field session found this spawning yt-dlp's update with NO gate at
+        all: the automatic startup check correctly deferred (something was
+        running) but left 'yt-dlp' sitting in _tools_needing_update, and this
+        button - the THIRD caller of _update_ytdlp, invisible to the first
+        two rounds of gating because it passes the method as a bare thread
+        target rather than calling it with parens - ran it anyway once
+        pressed. Same hazard as the other two: replacing yt-dlp.exe while an
+        invocation is in flight corrupts it mid-read.
+        """
         self._dismiss_update_banner()
         needs = getattr(self, '_tools_needing_update', [])
         if 'yt-dlp' in needs:
-            threading.Thread(target=self._update_ytdlp, daemon=True).start()
+            if getattr(self, '_download_active', False) or self._any_ytdlp_running():
+                self.append_terminal_output(
+                    'yt-dlp update skipped - a download or extraction is'
+                    ' running. Stop it and press Update again.\n', 'warning')
+            else:
+                threading.Thread(target=self._update_ytdlp, daemon=True).start()
         if 'ffmpeg' in needs:
             self._update_ffmpeg()
         self._tools_needing_update = []
@@ -17339,6 +17690,11 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                                 'yt-dlp update deferred - a download or an'
                                 ' extraction is still running. It will be'
                                 ' applied next launch.\n', 'info')
+                            # Deferred, not cancelled - but this specific
+                            # update INTENT is done: clear it, or a later
+                            # trigger of _run_pending_updates act on stale state.
+                            if 'yt-dlp' in self._tools_needing_update:
+                                self._tools_needing_update.remove('yt-dlp')
                         else:
                             self._update_ytdlp()
                     elif tool == 'ffmpeg':
@@ -18010,15 +18366,22 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         labels never show contrast boxes against their parent widget."""
         try:
             self._snapshot_light()
-            BG      = '#2b2b2b'   # single surface colour - used for everything
-            BG_IN   = '#333333'   # slightly raised: entries, treeview, comboboxes
-            BG_BTN  = '#3a3a3a'   # button face
-            BG_ACT  = '#4a4a4a'   # button hover / active
-            BG_SEL  = '#3a5a7a'   # selection highlight - calm steel blue
-            FG      = '#e0e0e0'   # primary text, near-white but not harsh
-            FG_DIM  = '#909090'   # secondary / muted text
+            # VS Code Dark+ derived - a real, well-known reference rather than
+            # an invented grey scale. Every style.configure/map call below is
+            # unchanged; only these 10 values move, so the whole theme stays
+            # internally consistent from one edit.
+            BG      = '#1e1e1e'   # main surface - VS Code editor.background
+            BG_IN   = '#252526'   # entries, treeview, comboboxes - sideBar.background
+            BG_BTN  = '#333333'   # button face, tab, treeview heading
+            BG_ACT  = '#3e3e42'   # hover / active - list.hoverBackground
+            BG_SEL  = '#264f78'   # selection highlight - editor.selectionBackground
+            ACCENT  = '#007acc'   # the one deliberate accent - VS Code's signature blue,
+                                   # spent in exactly one place (the progress bar), not on
+                                   # every button, so it still reads as an accent
+            FG      = '#cccccc'   # primary text - VS Code's default foreground
+            FG_DIM  = '#969696'   # secondary / muted text - descriptionForeground
             FG_SEL  = '#ffffff'   # selected text
-            BORDER  = '#484848'   # widget borders
+            BORDER  = '#3c3c3c'   # widget borders - panel border tone
 
             style = ttk.Style()
             style.theme_use('clam')
@@ -18130,12 +18493,12 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 background=[('active', BG_ACT)])
 
             style.configure('TSeparator', background=BORDER)
-            style.configure('TProgressbar', background='#5a8a5a', troughcolor=BG_IN)
+            style.configure('TProgressbar', background=ACCENT, troughcolor=BG_IN)
 
             # Terminal widget (tk.Text, not ttk - set directly)
             if hasattr(self, 'terminal_text'):
                 self.terminal_text.config(
-                    background='#252525', foreground='#d4d4d4',
+                    background=BG_IN, foreground='#d4d4d4',
                     insertbackground='#d4d4d4')
 
             # Fix up treeview row tags for dark bg (muted pastels)
