@@ -1368,6 +1368,20 @@ class YouTubeStreamAnalyzerGUI:
         self.playlist_pace_fixed = 3
         self.playlist_batch_size = 50
         self.playlist_direction = 'newest'   # newest | oldest
+        # Off by default: already-downloaded rows collapse to one summary
+        # line for speed (real field measurement: cuts window-open widget
+        # count roughly 65% on a large channel). Turning this on trades
+        # that speed back for the ability to deliberately re-select
+        # something you already have - greyed to stay visually distinct,
+        # but a real checkbox this time, unlike the pre-summary rows.
+        self.playlist_show_downloaded = False
+        # Which channel tabs to combine when a bare channel URL is
+        # detected. All default True - 'everything included' matches
+        # what a bare handle used to do by accident; this makes it
+        # explicit and individually adjustable instead.
+        self.playlist_include_videos = True
+        self.playlist_include_shorts = True
+        self.playlist_include_streams = True
         self.hardsub_crf = 23
         # Verbose diagnostics: its own FILE and its own LOCK, so it never
         # touches the terminal widget, _output_listeners or the main thread.
@@ -2066,8 +2080,34 @@ class YouTubeStreamAnalyzerGUI:
             # file starts at 0.000 and is read without arithmetic.
             self._session_log_t0 = time.monotonic()
             self._log_at_line_start = True
-            logs = sorted(f for f in os.listdir(base) if f.endswith('.log'))
-            for _stale in logs[:-30]:
+            # Session logs (YSA_<ts>.log) and verbose logs (YSA_VERBOSE_<ts>.log)
+            # live in this same directory and must be pruned SEPARATELY.
+            # Sorting them together is where this broke: '2' (the first
+            # digit of every session log's timestamp) sorts before 'V'
+            # (verbose) in a plain string sort, REGARDLESS of actual file
+            # age - so every session log was always classified as older
+            # than every verbose log, no matter when either was actually
+            # created. With 30+ verbose logs already present (routine
+            # once verbose logging has been used across a few sessions),
+            # logs[:-30] kept 30 files that were ALL verbose logs and
+            # deleted every session log outright, every single launch -
+            # confirmed directly: a real folder listing showed exactly
+            # 30 verbose logs (the cap, functioning as designed for that
+            # type) and zero session logs older than the current launch.
+            _log_files = os.listdir(base)
+            _session_logs = sorted(f for f in _log_files
+                                   if f.startswith('YSA_')
+                                   and not f.startswith('YSA_VERBOSE_')
+                                   and f.endswith('.log'))
+            for _stale in _session_logs[:-30]:
+                try:
+                    os.remove(os.path.join(base, _stale))
+                except Exception:
+                    pass
+            _verbose_logs = sorted(f for f in _log_files
+                                   if f.startswith('YSA_VERBOSE_')
+                                   and f.endswith('.log'))
+            for _stale in _verbose_logs[:-30]:
                 try:
                     os.remove(os.path.join(base, _stale))
                 except Exception:
@@ -10243,6 +10283,31 @@ Total Streams: {len(self.current_formats)}"""
                      values=('Newest first', 'Oldest first'), state='readonly',
                      width=12).grid(row=4, column=1, sticky=tk.W, padx=(6, 0))
 
+        playlist_show_downloaded_var = tk.BooleanVar(
+            value=getattr(self, 'playlist_show_downloaded', False))
+        ttk.Checkbutton(_pl_frame,
+                       text="Show already-downloaded videos in the checklist"
+                            " (greyed, still selectable)",
+                       variable=playlist_show_downloaded_var).grid(
+            row=6, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+
+        ttk.Label(_pl_frame, text="Include tabs:").grid(
+            row=7, column=0, sticky=tk.W, pady=(6, 0))
+        playlist_inc_videos_var = tk.BooleanVar(
+            value=getattr(self, 'playlist_include_videos', True))
+        playlist_inc_shorts_var = tk.BooleanVar(
+            value=getattr(self, 'playlist_include_shorts', True))
+        playlist_inc_streams_var = tk.BooleanVar(
+            value=getattr(self, 'playlist_include_streams', True))
+        _pl_tabs_row = ttk.Frame(_pl_frame)
+        _pl_tabs_row.grid(row=7, column=1, sticky=tk.W, padx=(6, 0), pady=(6, 0))
+        ttk.Checkbutton(_pl_tabs_row, text="Videos",
+                       variable=playlist_inc_videos_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(_pl_tabs_row, text="Shorts",
+                       variable=playlist_inc_shorts_var).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(_pl_tabs_row, text="Live streams",
+                       variable=playlist_inc_streams_var).pack(side=tk.LEFT, padx=(8, 0))
+
         ttk.Label(_pl_frame,
                   text="Applies only when a pasted URL is a playlist or channel.\n"
                        "Single-video downloads are never affected by this section.",
@@ -10375,6 +10440,10 @@ Total Streams: {len(self.current_formats)}"""
                 self.playlist_batch_size = 50
             self.playlist_direction = ('newest' if playlist_direction_var.get() == 'Newest first'
                                        else 'oldest')
+            self.playlist_show_downloaded = playlist_show_downloaded_var.get()
+            self.playlist_include_videos = playlist_inc_videos_var.get()
+            self.playlist_include_shorts = playlist_inc_shorts_var.get()
+            self.playlist_include_streams = playlist_inc_streams_var.get()
             try:
                 self.hardsub_crf = max(0, min(51, int(hardsub_crf_var.get())))
             except ValueError:
@@ -16813,6 +16882,14 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             self.playlist_pace_fixed = self._cfg_get(cfg, 'playlist_pace_fixed', 3, int)
             self.playlist_batch_size = self._cfg_get(cfg, 'playlist_batch_size', 50, int)
             self.playlist_direction = self._cfg_get(cfg, 'playlist_direction', 'newest', str)
+            self.playlist_show_downloaded = self._cfg_get(
+                cfg, 'playlist_show_downloaded', False, bool)
+            self.playlist_include_videos = self._cfg_get(
+                cfg, 'playlist_include_videos', True, bool)
+            self.playlist_include_shorts = self._cfg_get(
+                cfg, 'playlist_include_shorts', True, bool)
+            self.playlist_include_streams = self._cfg_get(
+                cfg, 'playlist_include_streams', True, bool)
             self.hardsub_crf = self._cfg_get(cfg, 'hardsub_crf', 23, int)
             self.verbose_logging = self._cfg_get(cfg, 'verbose_logging', False, bool)
             self.audio_only_mode_default = self._cfg_get(cfg, 'audio_only_mode', self.audio_only_mode_default, bool)
@@ -16924,6 +17001,10 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 'playlist_pace_fixed': self.playlist_pace_fixed,
                 'playlist_batch_size': self.playlist_batch_size,
                 'playlist_direction': self.playlist_direction,
+                'playlist_show_downloaded': self.playlist_show_downloaded,
+                'playlist_include_videos': self.playlist_include_videos,
+                'playlist_include_shorts': self.playlist_include_shorts,
+                'playlist_include_streams': self.playlist_include_streams,
                 'hardsub_crf': self.hardsub_crf,
                 'verbose_logging': self.verbose_logging,
                 'audio_only_mode': self.audio_only_mode.get() if hasattr(self, 'audio_only_mode') else self.audio_only_mode_default,
@@ -17033,6 +17114,99 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             return _vid or (url or '')
         except Exception:
             return url or ''
+
+    def _playlist_entries_with_history(self, entries):
+        """Tag each flat-playlist entry with whether it is already in
+        download history, using the SAME key derivation _record_attempt
+        and _record_download already use - so a video that shows as
+        downloaded here is guaranteed to be identified the same way
+        everywhere else in the app.
+
+        Pure with respect to self.download_history: reads it, never
+        writes it, touches no network and no filesystem, and returns a
+        NEW list rather than mutating entries. Reading (not writing)
+        self.download_history from a worker thread is the same
+        tolerance already relied on elsewhere in this codebase - the
+        documented hazard is background WRITES to shared state, not
+        reads of an already-populated list.
+
+        Each entry in the input is a raw flat-playlist dict from yt-dlp
+        (id, title, upload_date, ...). Returns dicts with exactly the
+        fields the selection window needs: id, title, upload_date, and
+        already_downloaded.
+        """
+        try:
+            _known = set()
+            for h in (self.download_history or []):
+                if h.get('status') == 'ok':
+                    _k = self._history_key(h.get('url', ''),
+                                           {'id': h.get('video_id')})
+                    if _k:
+                        _known.add(_k)
+        except Exception:
+            _known = set()
+
+        tagged = []
+        for e in (entries or []):
+            try:
+                vid_id = e.get('id') or e.get('url', '')
+                key = self._history_key('', {'id': vid_id}) if vid_id else ''
+                tagged.append({
+                    'id': vid_id,
+                    'title': e.get('title', '') or vid_id,
+                    'upload_date': e.get('upload_date', '') or '',
+                    'already_downloaded': bool(key) and key in _known,
+                })
+            except Exception:
+                continue
+        return tagged
+
+    def _playlist_batch_default_selection(self, tagged_entries, direction, batch_size):
+        """Which video ids start checked when the batch window opens.
+
+        Already-downloaded entries are never selectable at all, so they
+        are excluded before batch_size is applied - a batch size of 50
+        means 50 videos actually worth queuing, not 50 slots half-eaten
+        by rows that had nothing to do. direction picks which END of the
+        (already newest-first, per YouTube's own ordering) list the
+        batch is taken from: 'newest' takes the first batch_size
+        selectable ids in that order, 'oldest' reverses first.
+
+        Pure: touches neither self state nor any widget. Returns a plain
+        list (not a set) so the caller can also use it as "the near-edge
+        order" for the very first render, before any stepping happens.
+        """
+        selectable = [e['id'] for e in (tagged_entries or [])
+                     if not e.get('already_downloaded') and e.get('id')]
+        if direction == 'oldest':
+            selectable = list(reversed(selectable))
+        return selectable[:max(0, int(batch_size or 0))]
+
+    def _playlist_batch_step_selection(self, ids_in_order, checked_ids, delta):
+        """The +1/-1/+10/-10 stepper. ids_in_order is the selectable ids
+        in the CURRENT direction's near-to-far order (what
+        _playlist_batch_default_selection's own ordering produces,
+        before slicing). checked_ids is the CURRENT checked set -
+        individual manual (un)checks included, not just what a previous
+        step produced. Returns a NEW set; never mutates checked_ids.
+
+        Growing (delta > 0) checks the next `delta` unchecked ids
+        nearest the edge. Shrinking (delta < 0) unchecks the `delta`
+        checked ids FARTHEST from the edge, so a video someone
+        individually checked deep in the list is not the first thing a
+        later '-1' removes - the boundary shrinks from the far end
+        while whatever is closest to the edge stays selected.
+        """
+        checked_ids = set(checked_ids or ())
+        if delta > 0:
+            to_add = [i for i in ids_in_order if i not in checked_ids][:delta]
+            return checked_ids | set(to_add)
+        if delta < 0:
+            checked_in_order = [i for i in ids_in_order if i in checked_ids]
+            cut = max(0, len(checked_in_order) + delta)
+            to_remove = set(checked_in_order[cut:])
+            return checked_ids - to_remove
+        return set(checked_ids)
 
     def _record_attempt(self, url, video_info=None):
         """Log a download the moment it STARTS, with status 'pending'.
@@ -18728,37 +18902,434 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
         return ('list=' in url or 'youtube.com/playlist' in url or
                 '/c/' in url or '/channel/' in url or '/@' in url)
 
+    def _show_playlist_compact_prompt(self, label, n_total, n_downloaded,
+                                       n_remaining, batch_default):
+        """The everyday playlist prompt - one glance, one click for the
+        common case, with the full checklist window one click further
+        for anyone who wants it. MAIN THREAD ONLY, same contract as
+        _show_playlist_batch_window: real widgets, wait_window() blocks
+        the caller until answered.
+
+        Returns 'batch' | 'all' | 'choose' | 'first' | None (cancelled,
+        including via the window's own close button).
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Playlist detected")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.result = None
+
+        ttk.Label(dialog, text=str(label), font=('Arial', 9, 'bold'),
+                 wraplength=340, justify=tk.LEFT).pack(
+            anchor=tk.W, padx=14, pady=(12, 2))
+        ttk.Label(dialog,
+                 text=str(n_total) + " videos found  ·  " + str(n_downloaded)
+                      + " already downloaded  ·  " + str(n_remaining) + " remaining",
+                 foreground='gray').pack(anchor=tk.W, padx=14, pady=(0, 10))
+
+        def choose(action):
+            dialog.result = action
+            dialog.destroy()
+
+        btns = ttk.Frame(dialog)
+        btns.pack(fill=tk.X, padx=14, pady=(0, 12))
+        ttk.Button(btns, text="Queue next " + str(min(batch_default, n_remaining)),
+                  command=lambda: choose('batch')).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="Choose specific videos…",
+                  command=lambda: choose('choose')).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="Queue all " + str(n_remaining) + " remaining",
+                  command=lambda: choose('all')).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="Analyze first video only",
+                  command=lambda: choose('first')).pack(fill=tk.X, pady=2)
+        ttk.Button(btns, text="Cancel",
+                  command=lambda: choose(None)).pack(fill=tk.X, pady=(8, 0))
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        dialog.update_idletasks()
+        dialog.geometry('+%d+%d' % (self.root.winfo_x() + 60, self.root.winfo_y() + 60))
+        self.root.wait_window(dialog)
+        return dialog.result
+
+    def _show_playlist_batch_window(self, channel_label, tagged_entries):
+        """The batch-selection window: direction toggle, +/-1 and +/-10
+        stepper, a scrollable checklist, Queue/Cancel.
+
+        MAIN THREAD ONLY. This constructs real Tk widgets and must never
+        be called directly from a worker thread - the caller schedules it
+        via self.root.after(0, ...) and blocks on a threading.Event, the
+        exact pattern the existing playlist confirmation dialog already
+        uses for messagebox.askyesnocancel. wait_window() below is what
+        makes this call block until the user responds, the same role
+        askyesnocancel plays internally for the simpler dialog it
+        replaces.
+
+        Returns the list of chosen video ids, or an empty list if
+        cancelled (including via the window's own close button - no
+        special-case handling needed, since dialog.result simply never
+        gets set to anything but [] until Queue is actually pressed).
+
+        All selection logic is delegated to the two pure functions built
+        earlier - this method decides nothing about WHICH ids get
+        selected, only how to display and react to clicks.
+        """
+        selectable = [e for e in tagged_entries if not e.get('already_downloaded')]
+        n_total = len(tagged_entries)
+        n_downloaded = n_total - len(selectable)
+        direction = getattr(self, 'playlist_direction', 'newest')
+        batch_default = max(1, int(getattr(self, 'playlist_batch_size', 50) or 50))
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Choose videos - " + str(channel_label))
+        dialog.geometry("440x620")
+        dialog.minsize(360, 420)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.result = []
+        # Referenced by the already-downloaded rows when
+        # playlist_show_downloaded is on - configuring it here, once per
+        # window open, is idempotent and keeps the definition next to its
+        # only use rather than requiring a separate startup-time home.
+        ttk.Style().configure('Downloaded.TCheckbutton', foreground='gray')
+
+        self._vlog('ACTION: playlist_batch_window_open', [
+            'channel=' + str(channel_label), 'total=' + str(n_total),
+            'already_downloaded=' + str(n_downloaded),
+            'batch_default=' + str(batch_default), 'direction=' + str(direction)])
+
+        # sort_mode covers four orderings: the two upload-order directions
+        # (trusting the channel tab's own presentation order, same as
+        # before) plus two title orderings. Title is the field actually
+        # available for free - upload_date is not returned by
+        # flat-playlist extraction at all (a known, still-open yt-dlp
+        # limitation, confirmed directly rather than assumed), so title
+        # is what can genuinely be sorted by beyond the tab's own order.
+        state = {'sort_mode': 'upload_' + direction}
+        state['checked'] = set(self._playlist_batch_default_selection(
+            tagged_entries, direction, batch_default))
+        row_frames = {}
+
+        def ids_in_mode_order(entries_list, mode):
+            if mode == 'upload_oldest':
+                entries_list = list(reversed(entries_list))
+            elif mode == 'title_az':
+                entries_list = sorted(entries_list,
+                                      key=lambda e: (e.get('title') or '').lower())
+            elif mode == 'title_za':
+                entries_list = sorted(entries_list,
+                                      key=lambda e: (e.get('title') or '').lower(),
+                                      reverse=True)
+            return [e['id'] for e in entries_list]
+
+        def current_order():
+            # For the stepper: selectable ids only - already-downloaded
+            # rows are never checkable regardless of sort mode.
+            return ids_in_mode_order(selectable, state['sort_mode'])
+
+        def visual_order():
+            # For re-packing rows on screen: whatever is actually
+            # displayed (includes already-downloaded rows when
+            # playlist_show_downloaded is on, so those move together
+            # with everything else rather than staying stranded in
+            # their original spots while the rest reorders around them).
+            return ids_in_mode_order(_rows, state['sort_mode'])
+
+        header = ttk.Label(dialog,
+                           text=str(n_total) + " videos found  ·  "
+                                + str(n_downloaded) + " already downloaded")
+        header.pack(anchor=tk.W, padx=12, pady=(10, 6))
+
+        dir_row = ttk.Frame(dialog)
+        dir_row.pack(pady=(0, 6))
+        _SORT_LABELS = ('Upload order (newest first)', 'Upload order (oldest first)',
+                        'Title (A-Z)', 'Title (Z-A)')
+        _SORT_MODES = ('upload_newest', 'upload_oldest', 'title_az', 'title_za')
+        _label_to_mode = dict(zip(_SORT_LABELS, _SORT_MODES))
+        _mode_to_label = dict(zip(_SORT_MODES, _SORT_LABELS))
+        sort_var = tk.StringVar(value=_mode_to_label.get(state['sort_mode'], _SORT_LABELS[0]))
+        sort_combo = ttk.Combobox(dir_row, textvariable=sort_var, state='readonly',
+                                  width=26, values=_SORT_LABELS)
+        sort_combo.pack()
+
+        count_label = ttk.Label(dialog, font=('Arial', 14, 'bold'))
+        count_label.pack(pady=(0, 2))
+        note_label = ttk.Label(dialog, font=('Arial', 8), foreground='gray')
+        note_label.pack(pady=(0, 6))
+
+        step_row = ttk.Frame(dialog)
+        step_row.pack(pady=(0, 8))
+
+        # Packed BEFORE the expanding canvas below, on purpose: pack()
+        # claims space in the order calls happen, so a side=BOTTOM row
+        # packed here reserves its space from the bottom edge first: the
+        # canvas, packed afterwards with expand=True, only ever fills
+        # whatever remains. Packed after the canvas instead, the canvas
+        # would already have claimed the whole cavity and the button row
+        # could end up placed outside the visible window - which is
+        # exactly the bug this fixes, not just a bigger height number.
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=10)
+
+        def do_cancel():
+            dialog.result = []
+            dialog.destroy()
+
+        def do_queue():
+            _pool = tagged_entries if getattr(self, 'playlist_show_downloaded', False) else selectable
+            dialog.result = [i for i in [e['id'] for e in _pool] if i in state['checked']]
+            dialog.destroy()
+
+        queue_btn = ttk.Button(btn_row, text="Queue selected", command=do_queue)
+        queue_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+        ttk.Button(btn_row, text="Cancel", command=do_cancel).pack(
+            side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
+        dialog.protocol("WM_DELETE_WINDOW", do_cancel)
+
+        list_canvas = tk.Canvas(dialog, borderwidth=0, highlightthickness=0)
+        list_frame = ttk.Frame(list_canvas)
+        list_scroll = ttk.Scrollbar(dialog, orient='vertical', command=list_canvas.yview)
+        list_canvas.configure(yscrollcommand=list_scroll.set)
+        list_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
+        list_scroll.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
+        _win = list_canvas.create_window((0, 0), window=list_frame, anchor='nw')
+        list_frame.bind('<Configure>',
+                        lambda _e: list_canvas.configure(scrollregion=list_canvas.bbox('all')))
+        list_canvas.bind('<Configure>',
+                         lambda _e: list_canvas.itemconfig(_win, width=_e.width))
+
+        row_vars = {}
+
+        def refresh_counts():
+            n = len(state['checked'])
+            count_label.config(text=str(n) + " selected")
+            if n > batch_default:
+                note_label.config(text=str(n) + " selected — a typical batch starts "
+                                        "around " + str(batch_default) + " at a time")
+            else:
+                note_label.config(text="")
+            queue_btn.config(text="Queue selected (" + str(n) + ")")
+
+        def on_row_toggle(vid):
+            def _f():
+                if row_vars[vid].get():
+                    state['checked'].add(vid)
+                else:
+                    state['checked'].discard(vid)
+                self._vlog('ACTION: playlist_row_toggle', [
+                    'id=' + str(vid), 'checked=' + str(vid in state['checked']),
+                    'total_checked=' + str(len(state['checked']))])
+                refresh_counts()
+            return _f
+
+        # Already-downloaded rows are never interactive - nothing to click,
+        # nothing to decide - so they cost widgets for zero benefit shown
+        # individually. One summary line instead of up to hundreds of
+        # near-identical greyed rows is the single biggest lever on how
+        # long this window takes to build; a real channel in the field
+        # had 167 of these.
+        _show_dl = getattr(self, 'playlist_show_downloaded', False)
+        if n_downloaded and not _show_dl:
+            ttk.Label(list_frame,
+                     text=str(n_downloaded) + " already downloaded (not shown)",
+                     foreground='gray', font=('Arial', 9, 'italic')).pack(
+                anchor=tk.W, pady=(2, 8))
+
+        _rows = tagged_entries if _show_dl else selectable
+        for e in _rows:
+            row = ttk.Frame(list_frame)
+            row.pack(fill=tk.X, pady=1)
+            row_frames[e['id']] = row
+            _text = str(e.get('title', ''))
+            _date = str(e.get('upload_date', ''))
+            if _date:
+                _text = _text + '   ·   ' + _date
+            if e.get('already_downloaded'):
+                # Never pre-checked - _playlist_batch_default_selection
+                # already excludes these from the default batch, and that
+                # stays true regardless of this display setting. Checking
+                # one here is always a DELIBERATE choice to re-download.
+                v = tk.BooleanVar(value=False)
+                row_vars[e['id']] = v
+                ttk.Checkbutton(row, text=_text, variable=v,
+                               command=on_row_toggle(e['id']),
+                               style='Downloaded.TCheckbutton').pack(
+                    side=tk.LEFT, fill=tk.X, expand=True)
+            else:
+                v = tk.BooleanVar(value=e['id'] in state['checked'])
+                row_vars[e['id']] = v
+                ttk.Checkbutton(row, text=_text, variable=v,
+                               command=on_row_toggle(e['id'])).pack(
+                    side=tk.LEFT, fill=tk.X, expand=True)
+
+        def apply_step(delta):
+            _before = len(state['checked'])
+            new_checked = self._playlist_batch_step_selection(
+                current_order(), state['checked'], delta)
+            state['checked'] = new_checked
+            for vid, v in row_vars.items():
+                v.set(vid in new_checked)
+            self._vlog('ACTION: playlist_step', [
+                'delta=' + str(delta), 'checked_before=' + str(_before),
+                'checked_after=' + str(len(new_checked))])
+            refresh_counts()
+
+        for _label, _delta in (("-10", -10), ("-1", -1), ("+1", 1), ("+10", 10)):
+            ttk.Button(step_row, text=_label, width=4,
+                      command=lambda d=_delta: apply_step(d)).pack(side=tk.LEFT, padx=2)
+
+        def apply_sort_mode(new_mode):
+            _old_mode = state['sort_mode']
+            _before = len(state['checked'])
+            state['sort_mode'] = new_mode
+            # pack_forget() then pack() again, in the new order, is the
+            # standard Tkinter idiom for reordering already-created
+            # widgets in place without destroying and rebuilding them.
+            for vid in visual_order():
+                fr = row_frames.get(vid)
+                if fr is not None:
+                    fr.pack_forget()
+                    fr.pack(fill=tk.X, pady=1)
+            # A fresh default batch in the NEW order - matching how the
+            # old newest/oldest toggle already behaved: changing the
+            # order always gives a sensible default for THAT order,
+            # rather than leaving a selection computed under a
+            # different one.
+            new_ids = current_order()
+            state['checked'] = set(new_ids[:batch_default])
+            for vid, v in row_vars.items():
+                v.set(vid in state['checked'])
+            self._vlog('ACTION: playlist_sort_change', [
+                'old=' + str(_old_mode), 'new=' + str(new_mode),
+                'checked_before=' + str(_before),
+                'checked_after=' + str(len(state['checked']))])
+            refresh_counts()
+
+        def on_sort_change(_evt=None):
+            apply_sort_mode(_label_to_mode.get(sort_var.get(), 'upload_newest'))
+
+        sort_combo.bind('<<ComboboxSelected>>', on_sort_change)
+
+        # The real Queue/Cancel row - btn_row, do_queue, do_cancel,
+        # WM_DELETE_WINDOW - is defined earlier, before the canvas
+        # (side=tk.BOTTOM, packed first so it always reserves its space).
+        # A second, fully duplicate copy used to sit here, orphaned by an
+        # earlier patch that added the correct one without removing this.
+        refresh_counts()
+        self.root.wait_window(dialog)
+        return dialog.result
+
     def _handle_playlist_worker(self, url):
         """Detect playlist size, confirm with user, then enqueue each video."""
         try:
+            # A bare channel URL (/@handle, /c/, /channel/ - never a real
+            # playlist, which has its own creator-defined order that has
+            # nothing to do with upload date) does not reliably guarantee
+            # a single, clean, chronologically-ordered feed - some
+            # evidence suggests it can mix in Shorts/streams rather than
+            # giving just the Videos tab. Targeting /videos explicitly
+            # removes that uncertainty rather than trusting the default.
+            _lu = url.lower()
+            _is_channel = ('/c/' in _lu or '/channel/' in _lu or '/@' in _lu)
+            _is_real_playlist = ('list=' in _lu or 'youtube.com/playlist' in _lu)
+            _has_tab = any(_lu.rstrip('/').endswith(s) for s in
+                          ('/videos', '/shorts', '/streams', '/playlists',
+                           '/community', '/about'))
+
+            # A bare channel URL pulls from ALL its tabs mixed together, in
+            # a way that is undocumented and not reliably consistent
+            # (confirmed against real yt-dlp reports: users asking how to
+            # EXCLUDE Shorts from a bare-handle extraction, because there is
+            # no way to tell afterward which tab an entry came from). An
+            # earlier version of this code targeted /videos alone for
+            # reliability - which is correct in isolation, but silently
+            # dropped every Short a bare handle used to include, breaking a
+            # real, relied-upon workflow. Querying /videos and /shorts
+            # EXPLICITLY and combining them restores that same comprehensive
+            # coverage while keeping full visibility into where each entry
+            # came from - the per-tab counts are logged below. An EXPLICIT
+            # tab in the URL (the user typed /shorts themselves, say) is
+            # always respected as-is and never combined with anything else.
+            if _is_channel and not _is_real_playlist and not _has_tab:
+                _base = url.rstrip('/')
+                _detect_urls = []
+                if getattr(self, 'playlist_include_videos', True):
+                    _detect_urls.append((_base + '/videos', 'videos'))
+                if getattr(self, 'playlist_include_shorts', True):
+                    _detect_urls.append((_base + '/shorts', 'shorts'))
+                if getattr(self, 'playlist_include_streams', True):
+                    _detect_urls.append((_base + '/streams', 'streams'))
+            else:
+                _detect_urls = [(url, None)]
+
             self.root.after(0, lambda: self.paste_btn.config(state='disabled'))
             self.root.after(0, lambda: self.progress_bar.start())
             self.root.after(0, lambda: self.progress_var.set("Detecting playlist..."))
-            self.append_terminal_output('Detecting playlist: ' + url + '\n', 'info')
 
-            # Get flat playlist entries to count videos
-            args = [
-                '--flat-playlist', '--dump-json', '--no-warnings',
-                '--extractor-args', 'youtube:player_client=default,-tv_simply',
-            ]
-            args.extend(self.get_ytdlp_dns_args())
-            if self.yt_dlp_cache_dir:
-                args.extend(['--cache-dir', self.yt_dlp_cache_dir])
-            args.append(url)
-
-            result = self.run_ytdlp_command(args, timeout=60)
-            if result.returncode != 0 or not result.stdout.strip():
-                self.root.after(0, lambda: self._notify_error(
-                    "Playlist Error", "Could not read playlist. Is the URL correct?"))
-                return
-
-            lines = [l for l in result.stdout.strip().splitlines() if l.strip()]
             entries = []
-            for line in lines:
-                try:
-                    entries.append(json.loads(line))
-                except Exception:
-                    pass
+            _seen_ids = set()
+            _tab_counts = {}
+            for _durl, _tab_label in _detect_urls:
+                self.append_terminal_output('Detecting playlist: ' + _durl + '\n', 'info')
+
+                # Get flat playlist entries to count videos
+                args = [
+                    '--flat-playlist', '--dump-json', '--no-warnings',
+                    '--extractor-args', 'youtube:player_client=default,-tv_simply',
+                ]
+                args.extend(self.get_ytdlp_dns_args())
+                if self.yt_dlp_cache_dir:
+                    args.extend(['--cache-dir', self.yt_dlp_cache_dir])
+                args.append(_durl)
+
+                result = self.run_ytdlp_command(args, timeout=60)
+                if result.returncode != 0 or not result.stdout.strip():
+                    # A channel genuinely without a Shorts tab errors here -
+                    # expected and NOT fatal when combining multiple tabs (0
+                    # shorts is not a failure). Still fatal for a single,
+                    # explicitly-requested URL, matching original behaviour.
+                    if len(_detect_urls) == 1:
+                        self.root.after(0, lambda: self._notify_error(
+                            "Playlist Error", "Could not read playlist. Is the URL correct?"))
+                        return
+                    if _tab_label:
+                        _tab_counts[_tab_label] = 0
+                    continue
+
+                lines = [l for l in result.stdout.strip().splitlines() if l.strip()]
+                _tab_n = 0
+                for line in lines:
+                    try:
+                        _e = json.loads(line)
+                    except Exception:
+                        continue
+                    _eid = _e.get('id') or _e.get('url', '')
+                    if _eid and _eid in _seen_ids:
+                        continue
+                    if _eid:
+                        _seen_ids.add(_eid)
+                    entries.append(_e)
+                    _tab_n += 1
+                if _tab_label:
+                    _tab_counts[_tab_label] = _tab_n
+
+            if len(_detect_urls) > 1:
+                self.append_terminal_output(
+                    'Combined tabs: ' + ', '.join(
+                        k + '=' + str(v) for k, v in _tab_counts.items()) + '\n', 'info')
+
+            # Directly answers "is this actually in upload-date order" the
+            # next time it matters, from a real log instead of a guess -
+            # rather than assume newest-first holds, or silently ignore
+            # that upload_date can be blank in flat-playlist output.
+            _dates = [e.get('upload_date') for e in entries if e.get('upload_date')]
+            if len(_dates) >= 2:
+                self.append_terminal_output(
+                    'Order check: first 3 dates ' + str(_dates[:3])
+                    + ', last 3 dates ' + str(_dates[-3:]) + '\n', 'info')
+            elif entries:
+                self.append_terminal_output(
+                    'Order check: upload_date not present in flat-playlist '
+                    'output for this URL - ordering cannot be verified from it.\n',
+                    'warning')
 
             n = len(entries)
             if n == 0:
@@ -18769,28 +19340,50 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
             self.append_terminal_output(
                 'Playlist detected: ' + str(n) + ' video(s)\n', 'info')
 
-            # Confirm with user on main thread
-            confirmed = threading.Event()
-            single_only = threading.Event()
+            # Cross-reference against history BEFORE asking anything - the
+            # counts shown in the prompt, and what "queue all remaining"
+            # means, both depend on this.
+            tagged = self._playlist_entries_with_history(entries)
+            n_downloaded = sum(1 for t in tagged if t.get('already_downloaded'))
+            n_remaining = n - n_downloaded
+            _direction = getattr(self, 'playlist_direction', 'newest')
+            _batch_default = max(1, int(getattr(self, 'playlist_batch_size', 50) or 50))
+            # Printed to the SESSION log, not just verbose - this exact
+            # count used to be visible only as text inside a dialog widget.
+            self.append_terminal_output(
+                str(n_downloaded) + ' of ' + str(n) + ' already in history, '
+                + str(n_remaining) + ' remaining (direction: ' + _direction + ')\n',
+                'info')
+
+            decided = threading.Event()
+            outcome = {'ids': None, 'first_only': False}
 
             def ask():
-                ans = messagebox.askyesnocancel(
-                    "Playlist Detected",
-                    "Playlist detected (" + str(n) + " video(s))." + "\n\n"
-                    "Yes  - Queue all " + str(n) + " videos\n"
-                    "No   - Analyze first video only\n"
-                    "Cancel - Abort")
-                if ans is True:
-                    confirmed.set()
-                elif ans is False:
-                    single_only.set()
-                    confirmed.set()
+                action = self._show_playlist_compact_prompt(
+                    url, n, n_downloaded, n_remaining, _batch_default)
+                if action == 'first':
+                    outcome['first_only'] = True
+                elif action == 'batch':
+                    outcome['ids'] = self._playlist_batch_default_selection(
+                        tagged, _direction, _batch_default)
+                elif action == 'all':
+                    outcome['ids'] = [t['id'] for t in tagged
+                                      if not t.get('already_downloaded')]
+                elif action == 'choose':
+                    outcome['ids'] = self._show_playlist_batch_window(url, tagged) or []
+                self.append_terminal_output(
+                    'Playlist choice: ' + str(action) + '  ->  '
+                    + str(len(outcome['ids']) if outcome['ids'] else 0) + ' video(s) selected\n',
+                    'info')
+                decided.set()
 
             self.root.after(0, ask)
-            confirmed.wait(timeout=120)
+            # A real person looking through a long checklist needs longer
+            # than the old 3-button dialog ever did.
+            decided.wait(timeout=600)
 
-            if single_only.is_set():
-                # Analyze just the first video
+            if outcome['first_only']:
+                # Analyze just the first video - unchanged from before.
                 first_id = entries[0].get('id') or entries[0].get('url', '')
                 if first_id:
                     video_url = 'https://www.youtube.com/watch?v=' + first_id
@@ -18798,11 +19391,12 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                     self.root.after(100, self.analyze_video)
                 return
 
-            if not confirmed.is_set():
+            chosen_ids = outcome['ids']
+            if not chosen_ids:
                 self.append_terminal_output('Playlist queuing cancelled.\n', 'warning')
                 return
 
-            # Queue all videos at default quality
+            # Queue the CHOSEN videos at default quality
             _target_q = getattr(self, 'default_quality', '') or ''
             if not _target_q:
                 # Mirror the batch-mode guard: with Auto-Download OFF there
@@ -18816,83 +19410,228 @@ This version uses yt-dlp.exe binary for maximum compatibility and portability.""
                 return
             target_q = _target_q
             self.append_terminal_output(
-                'Queuing playlist at ' + target_q + '...\n', 'info')
+                'Queuing ' + str(len(chosen_ids)) + ' video(s) at '
+                + target_q + '...\n', 'info')
 
-            for i, entry in enumerate(entries):
-                vid_id = entry.get('id') or entry.get('url', '')
-                if not vid_id:
-                    continue
+            import random as _random
+            _pace_mode = getattr(self, 'playlist_pace_mode', 'random')
+            _pace_min = getattr(self, 'playlist_pace_min', 2)
+            _pace_max = getattr(self, 'playlist_pace_max', 5)
+            _pace_fixed = getattr(self, 'playlist_pace_fixed', 3)
+            _by_id = {(e.get('id') or e.get('url', '')): e for e in entries}
+            n_chosen = len(chosen_ids)
+
+            _wave_size = max(1, min(8, int(getattr(self, 'batch_concurrent_fetches', 3) or 3)))
+            _fetch_lock = threading.Lock()
+
+            def _fetch_playlist_video(idx_vid, _results):
+                # Mirrors _batch_analyze_worker's own _fetch_one exactly -
+                # network-bound, safe to parallelise. Per-item failure is
+                # caught HERE so one bad video cannot abort its whole wave.
+                idx, vid_id = idx_vid
+                entry = _by_id.get(vid_id)
+                if not entry:
+                    with _fetch_lock:
+                        _results[idx] = (vid_id, None, 'no matching entry')
+                    return
                 video_url = 'https://www.youtube.com/watch?v=' + vid_id
-                self.root.after(0, lambda u=video_url, pos=i, total=n:
-                    self.append_terminal_output(
-                        'Queuing playlist: ' + str(pos + 1) + '/' + str(total) + '\n', 'info'))
                 try:
                     info = self.get_video_info(video_url)
-                    all_formats = info.get('formats', [])
+                    with _fetch_lock:
+                        _results[idx] = (vid_id, info, None)
+                except Exception as ex:
+                    with _fetch_lock:
+                        _results[idx] = (vid_id, None, str(ex))
 
-                    # Work entirely with local variables - never touch self.* shared state
-                    # from a background thread to avoid races with the main thread.
-                    local_video_streams = [
-                        f for f in all_formats
-                        if f.get('vcodec') not in (None, 'none')
-                        and f.get('acodec') in (None, 'none')]
-                    local_audio_streams = [
-                        f for f in all_formats
-                        if f.get('acodec') not in (None, 'none')
-                        and f.get('vcodec') in (None, 'none')]
+            i = 0
+            for _wave_start in range(0, n_chosen, _wave_size):
+                _wave_ids = chosen_ids[_wave_start:_wave_start + _wave_size]
+                _wave_results = [None] * len(_wave_ids)
+                _wave_end = min(_wave_start + len(_wave_ids), n_chosen)
 
-                    local_detected = {}
-                    for fmt in local_audio_streams:
-                        if 'detected_language' not in fmt:
-                            desc, lang = self.get_audio_stream_description(fmt)
-                            fmt['detected_language'] = lang
-                            fmt['description'] = desc
-                        local_detected.setdefault(fmt['detected_language'], []).append(fmt)
-
-                    best_audio = self.select_best_audio_stream(
-                        local_audio_streams, local_detected)
-
-                    target_h = int(target_q.replace('p', ''))
-                    # Use tier matching so non-standard resolutions (e.g.
-                    # 1086p) are matched when the target is 1080p.  Also use
-                    # min(h, w) for consistency with the recommended tab.
-                    def _pl_eff(v):
-                        _h = v.get('height', 0) or 0
-                        _w = v.get('width', 0) or 0
-                        return min(_h, _w) if _h and _w else (_h or _w)
-
-                    pl_candidates = [v for v in local_video_streams
-                                     if _pl_eff(v) > 0 and self._nearest_standard_quality(_pl_eff(v)) == target_h]
-                    best_video = self.select_best_video_stream(pl_candidates)
-
-                    if best_video and best_audio:
-                        vfid = str(best_video.get('format_id', ''))
-                        afid = str(best_audio.get('format_id', ''))
-                        title = info.get('title', 'Unknown')
-                        raw_ch = (info.get('uploader') or info.get('channel') or '').strip()
-                        ch = self.sanitize_filename(raw_ch) if raw_ch else ''
-                        safe_t = self.sanitize_filename(title)
-                        base = (ch + ' - ' + safe_t) if ch else safe_t
-                        out_path = os.path.join(
-                            self.download_path, base + ' [' + target_q + '].mp4')
-                        label = base + '  [' + target_q + ']'
-                        vid_id_snap = info.get('id', 'unknown')
-                        use_c = self.get_cached_video_path(vid_id_snap, vfid) is not None
-                        c_path = self.get_cached_video_path(vid_id_snap, vfid)
-                        w_args = (vfid, afid, out_path, target_q,
-                                  use_c, c_path, None, video_url, vid_id_snap, info)
-                        entry_dict = {
-                            'worker': self._download_and_merge_worker_with_terminal,
-                            'worker_name': 'merge',
-                            'args': w_args, 'label': label, 'is_audio': False}
-                        # M1 fix: queue mutations follow the _queue_lock
-                        # convention used everywhere else in the file.
-                        with self._queue_lock:
-                            self._download_queue.append(entry_dict)
-                        self.root.after(0, self._refresh_queue_panel)
-                except Exception as e:
+                self.root.after(0, lambda a=_wave_start, b=_wave_end, t=n_chosen:
                     self.append_terminal_output(
-                        'Skipped video ' + str(i + 1) + ': ' + str(e) + '\n', 'warning')
+                        'Queuing playlist: ' + str(a + 1) + '-' + str(b) + '/' + str(t) + '\n', 'info'))
+
+                with ThreadPoolExecutor(max_workers=len(_wave_ids)) as _pool:
+                    list(_pool.map(
+                        lambda iv: _fetch_playlist_video(iv, _wave_results),
+                        enumerate(_wave_ids)))
+
+                # Process THIS wave's results IN ORDER, one at a time - the
+                # exact same downstream logic as before (format selection,
+                # cache check, entry_dict construction), just fed from a
+                # pre-fetched wave instead of a single just-fetched call.
+                for _wr in _wave_results:
+                    if _wr is None:
+                        i += 1
+                        continue
+                    vid_id, info, _fetch_err = _wr
+                    # video_url is trivially derivable from vid_id and
+                    # re-derived here on purpose: the preserved
+                    # format-selection block below reads it directly, and
+                    # it was previously computed only inside the now-
+                    # separate _fetch_playlist_video worker function,
+                    # whose locals do not leak back to this scope. That
+                    # gap produced an UnboundLocalError-style crash on
+                    # every single video, despite every analysis
+                    # succeeding - confirmed from a real field log where
+                    # all 30 fetches came back OK and all 30 were then
+                    # immediately skipped by this exact error.
+                    video_url = 'https://www.youtube.com/watch?v=' + vid_id
+                    if _fetch_err is not None:
+                        self.append_terminal_output(
+                            'Skipped video ' + str(i + 1) + ': ' + str(_fetch_err) + '\n', 'warning')
+                        i += 1
+                        continue
+                    try:
+                        all_formats = info.get('formats', [])
+
+                        # Work entirely with local variables - never touch self.* shared state
+                        # from a background thread to avoid races with the main thread.
+                        local_video_streams = [
+                            f for f in all_formats
+                            if f.get('vcodec') not in (None, 'none')
+                            and f.get('acodec') in (None, 'none')]
+                        local_audio_streams = [
+                            f for f in all_formats
+                            if f.get('acodec') not in (None, 'none')
+                            and f.get('vcodec') in (None, 'none')]
+
+                        local_detected = {}
+                        for fmt in local_audio_streams:
+                            if 'detected_language' not in fmt:
+                                desc, lang = self.get_audio_stream_description(fmt)
+                                fmt['detected_language'] = lang
+                                fmt['description'] = desc
+                            local_detected.setdefault(fmt['detected_language'], []).append(fmt)
+
+                        best_audio = self.select_best_audio_stream(
+                            local_audio_streams, local_detected)
+
+                        target_h = int(target_q.replace('p', ''))
+                        # Use tier matching so non-standard resolutions (e.g.
+                        # 1086p) are matched when the target is 1080p.  Also use
+                        # min(h, w) for consistency with the recommended tab.
+                        def _pl_eff(v):
+                            _h = v.get('height', 0) or 0
+                            _w = v.get('width', 0) or 0
+                            return min(_h, _w) if _h and _w else (_h or _w)
+
+                        # Falls back through lower standard tiers when the
+                        # exact target has no stream, mirroring
+                        # _auto_download_best_quality's own "try lower until
+                        # something resolves" behaviour for the single-video
+                        # path - confirmed directly from a real field log
+                        # where several videos had no 480p stream at all,
+                        # auto-fell-back to 360p there, and downloaded
+                        # successfully; the playlist worker had no equivalent
+                        # and simply produced no candidates for those tiers.
+                        # _pl_actual_q starts equal to target_q and only
+                        # changes if a lower tier is what actually resolved -
+                        # the exact-match case (the vast majority of videos)
+                        # behaves identically to before, since target_q is
+                        # always the first tier this loop tries.
+                        _pl_actual_q = target_q
+                        best_video = None
+                        _pl_tier_idx = (self._QUALITY_FALLBACK.index(target_q)
+                                       if target_q in self._QUALITY_FALLBACK else None)
+                        if _pl_tier_idx is not None:
+                            for _pl_tier in self._QUALITY_FALLBACK[_pl_tier_idx:]:
+                                _pl_h = int(_pl_tier.replace('p', ''))
+                                pl_candidates = [v for v in local_video_streams
+                                                 if _pl_eff(v) > 0
+                                                 and self._nearest_standard_quality(_pl_eff(v)) == _pl_h]
+                                best_video = self.select_best_video_stream(pl_candidates)
+                                if best_video:
+                                    _pl_actual_q = _pl_tier
+                                    break
+                        else:
+                            # target_q is not a standard tier - should not
+                            # normally happen; preserve the exact original,
+                            # single-tier behaviour rather than guess at a
+                            # fallback chain for a value not recognised.
+                            pl_candidates = [v for v in local_video_streams
+                                             if _pl_eff(v) > 0
+                                             and self._nearest_standard_quality(_pl_eff(v)) == target_h]
+                            best_video = self.select_best_video_stream(pl_candidates)
+
+                        if best_video and best_audio:
+                            vfid = str(best_video.get('format_id', ''))
+                            afid = str(best_audio.get('format_id', ''))
+                            title = info.get('title', 'Unknown')
+                            raw_ch = (info.get('uploader') or info.get('channel') or '').strip()
+                            ch = self.sanitize_filename(raw_ch) if raw_ch else ''
+                            safe_t = self.sanitize_filename(title)
+                            base = (ch + ' - ' + safe_t) if ch else safe_t
+                            out_path = os.path.join(
+                                self.download_path, base + ' [' + _pl_actual_q + '].mp4')
+                            label = base + '  [' + _pl_actual_q + ']'
+                            vid_id_snap = info.get('id', 'unknown')
+                            use_c = self.get_cached_video_path(vid_id_snap, vfid) is not None
+                            c_path = self.get_cached_video_path(vid_id_snap, vfid)
+                            w_args = (vfid, afid, out_path, _pl_actual_q,
+                                      use_c, c_path, None, video_url, vid_id_snap, info)
+                            entry_dict = {
+                                'worker': self._download_and_merge_worker_with_terminal,
+                                'worker_name': 'merge',
+                                'args': w_args, 'label': label, 'is_audio': False}
+                            # M1 fix: queue mutations follow the _queue_lock
+                            # convention used everywhere else in the file.
+                            with self._queue_lock:
+                                self._download_queue.append(entry_dict)
+                            self.root.after(0, self._refresh_queue_panel)
+                            # Start downloading as soon as something is
+                            # actually queued, not only after the whole batch
+                            # finishes - the SAME idempotent check the final
+                            # block below already used; calling it more often
+                            # here does not change what it does for its OTHER
+                            # callers (manual download, batch mode, session
+                            # restore all still call it exactly as before).
+                            self.root.after(0, lambda: (
+                                self._start_next_queued()
+                                if not self._download_active and not self._download_paused
+                                else None))
+
+                    
+                        else:
+                            # Silent before this fix: if EITHER stream is
+                            # missing, the whole block above is skipped -
+                            # no exception, no log line, nothing queued.
+                            # A video that fails here never reaches
+                            # history either, so it reappears as "not yet
+                            # downloaded" in every future batch, forever -
+                            # confirmed directly from a real report: the
+                            # same handful of videos surviving unchanged
+                            # through many consecutive batch runs.
+                            _missing = []
+                            if not best_video:
+                                _missing.append('video')
+                            if not best_audio:
+                                _missing.append('audio')
+                            self.append_terminal_output(
+                                'Skipped video ' + str(i + 1) + ': no matching '
+                                + '/'.join(_missing) + ' format at any tier from '
+                                + target_q + ' down to ' + self._QUALITY_FALLBACK[-1] + '\n',
+                                'warning')
+
+                    except Exception as e:
+                        self.append_terminal_output(
+                            'Skipped video ' + str(i + 1) + ': ' + str(e) + '\n', 'warning')
+                    i += 1
+
+                # Pace ONCE per WAVE, between waves - not within one. This
+                # is what preserves the throttled, spread-out traffic shape
+                # the whole feature exists for, while letting each wave's
+                # up to 8 videos - reusing the SAME cap already proven by
+                # the multi-URL-paste batch feature - run concurrently.
+                if _wave_end < n_chosen:
+                    if _pace_mode == 'random':
+                        _lo, _hi = min(_pace_min, _pace_max), max(_pace_min, _pace_max)
+                        time.sleep(_random.uniform(_lo, _hi))
+                    elif _pace_mode == 'fixed':
+                        time.sleep(max(0, _pace_fixed))
+                    # 'off' -> no delay
 
             with self._queue_lock:
                 _q_n = len(self._download_queue)
